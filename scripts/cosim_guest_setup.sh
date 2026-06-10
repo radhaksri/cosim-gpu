@@ -21,7 +21,11 @@ echo "=== MI300X Co-simulation Guest Setup ==="
 # ---- Environment ----
 export LD_LIBRARY_PATH=/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 export HSA_ENABLE_INTERRUPT=0
-export HCC_AMDGPU_TARGET=gfx942
+# xnack+ (recoverable GPU page faults) — required for ROCm device ASAN.
+# Needs the gem5 fault/replay + interrupt path (see plan-xnack.md Phases 2-4);
+# until those land, only no-fault / pre-resident workloads are expected to pass.
+export HSA_XNACK=1
+export HCC_AMDGPU_TARGET=gfx942:xnack+
 
 # ---- Detect GPU count ----
 GPU_COUNT=$(lspci -d 1002: | grep -c "Display\|VGA\|3D" || echo 0)
