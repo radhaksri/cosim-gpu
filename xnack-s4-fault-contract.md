@@ -4,16 +4,19 @@ Purpose: capture the exact hardware contract the **unmodified** gfx942 amdgpu/KF
 for a recoverable VM fault, so gem5 (Phases 3–4 of `plan-xnack.md`) can conform to it. The driver
 is the fixed point; gem5 must match these values.
 
-Source of truth used here: `TheRock/rocm-systems/.../aqlprofile/linux/registers/gc/gc_9_4_2_offset.h`
-and `gc_9_4_2_sh_mask.h` (the gfx942 GC register definitions present in the clone).
+Source of truth: the in-guest driver's own register headers,
+`amdgpu-dkms .../amd/include/asic_reg/gc/gc_9_4_3_offset.h` and `gc_9_4_3_sh_mask.h`.
+**MI300X is GC IP 9.4.3** (not 9.4.2). gem5's existing `MI300X_*` constants confirm this
+(e.g. `MI300X_VM_INVALIDATE_ENG17_ACK = 0x08a6` == `regVM_INVALIDATE_ENG17_ACK` in gc_9_4_3).
+Bitfield shifts are identical across 9.4.2/9.4.3; only register offsets differ.
 
 ## Status of this capture
 
 | Part of contract | Status | Source |
 |---|---|---|
-| GC VML2 fault registers (offsets + fields) | **Verified locally** | `gc_9_4_2_*` headers |
-| Retry-fault arming bit | **Verified locally** | `gc_9_4_2_sh_mask.h` |
-| VM invalidate (retry trigger) registers | **Verified locally** | `gc_9_4_2_offset.h` |
+| GC VML2 fault registers (offsets + fields) | **Verified** | `gc_9_4_3_*` headers (driver) |
+| Retry-fault arming bit | **Verified** | `gc_9_4_3_sh_mask.h` |
+| VM invalidate (retry trigger) registers | **Verified** | `gc_9_4_3_offset.h` |
 | IH client IDs / fault source IDs | **Verified** | amdgpu-dkms 6.14.14 `soc15_ih_clientid.h`, `irqsrcs_vmc_1_0.h` |
 | IV cookie layout read by ISR | **Verified** | amdgpu-dkms `soc15_int.h`, `gmc_v9_0.c:543-672` |
 | Fault-address encoding | **Verified** | `gmc_v9_0.c:562-563` |
@@ -32,13 +35,12 @@ All are GC IP, SOC15 segment 0 (`*_BASE_IDX = 0`). Absolute MMIO byte address =
 `<GC seg0 base> + offset*4` — gem5's `AMDGPUDevice` already decodes the GC aperture, so these must
 be made readable there.
 
-| Register | dword offset |
+| Register | dword offset (gc_9_4_3 / MI300X) |
 |---|---|
-| `VM_L2_PROTECTION_FAULT_CNTL`  | `0x0847` |
-| `VM_L2_PROTECTION_FAULT_CNTL2` | `0x0848` |
-| `VM_L2_PROTECTION_FAULT_STATUS`| `0x084b` |
-| `VM_L2_PROTECTION_FAULT_ADDR_LO32` | `0x084c` |
-| `VM_L2_PROTECTION_FAULT_ADDR_HI32` | `0x084d` |
+| `VM_L2_PROTECTION_FAULT_CNTL`  | `0x0827` |
+| `VM_L2_PROTECTION_FAULT_STATUS`| `0x082b` |
+| `VM_L2_PROTECTION_FAULT_ADDR_LO32` | `0x082c` |
+| `VM_L2_PROTECTION_FAULT_ADDR_HI32` | `0x082d` |
 
 ### STATUS bitfields (shifts verified; widths standard gfx9)
 | Field | shift | width |
@@ -61,18 +63,18 @@ raises the fault, then the driver reads it in its ISR.
 A "PTE not present" demand-paging fault is a **VALID** protection fault (bit 9). gem5 should only
 generate the interrupt for the fault classes the driver has enabled in CNTL.
 
-### ADDR_LO32/HI32 (encoding inferred — confirm against `gmc_v9_0.c`)
-Standard gfx9: the faulting address is reported page-shifted (`>>12`); LO32 holds the low 32 bits
-of `(addr>>12)`, HI32 the upper bits. The kernel reconstructs `addr = ((u64)hi32<<32 | lo32)<<12`.
-**Confirm the exact shift/packing in `gmc_v9_0_process_interrupt` before implementing.**
+### ADDR_LO32/HI32 — secondary (cookie is authoritative)
+The modern ISR derives the fault address from the **IH cookie** (see §4:
+`addr = (src_data[0]<<12) | ((src_data[1]&0xf)<<44)`), not from these registers. Populate the ADDR
+registers with `(addr>>12)` low/hi for completeness/debug, but the cookie is what drives recovery.
 
 ## 2. Retry-fault arming (verified)
 
-`VM_CONTEXT1_CNTL` (offset `0x0881`, seg 0) bit **7** =
+`VM_CONTEXT1_CNTL` (offset `0x0861`, seg 0) bit **7** =
 `RETRY_PERMISSION_OR_INVALID_PAGE_FAULT`. When the driver sets this for the compute VMID context,
 invalid-page faults become **retry** (recoverable) faults instead of fatal. Related fields:
 `RANGE_PROTECTION_FAULT_ENABLE_DEFAULT` (shift 10), `DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT`
-(shift 12), `PAGE_TABLE_BLOCK_SIZE` (shift 3). `VM_CONTEXT0_CNTL` = `0x0880`.
+(shift 12), `PAGE_TABLE_BLOCK_SIZE` (shift 3). `VM_CONTEXT0_CNTL` = `0x0860`.
 
 **gem5 implication:** only generate recoverable (park + interrupt + retry) faults when the driver
 has set bit 7 on the relevant context's CNTL; otherwise preserve the existing fatal/non-retry
@@ -83,13 +85,16 @@ behavior. gem5 must therefore observe writes to `VM_CONTEXTn_CNTL`.
 After the driver installs the PTE it issues a TLB invalidate; gem5 uses this as the
 "re-walk parked translations now" signal (Phase 4). Engine 0 register set (seg 0):
 
-| Register | dword offset |
+| Register | dword offset (gc_9_4_3 / MI300X) |
 |---|---|
-| `VM_INVALIDATE_ENG0_SEM` | `0x0891` |
-| `VM_INVALIDATE_ENG0_REQ` | `0x08a3` |
-| `VM_INVALIDATE_ENG0_ACK` | `0x08b5` |
-| `VM_INVALIDATE_ENG0_ADDR_RANGE_LO32` | `0x08c7` |
-| `VM_INVALIDATE_ENG0_ADDR_RANGE_HI32` | `0x08c8` |
+| `VM_INVALIDATE_ENG0_SEM` | `0x0871` |
+| `VM_INVALIDATE_ENG0_REQ` | `0x0883` |
+| `VM_INVALIDATE_ENG0_ACK` | `0x0895` |
+| `VM_INVALIDATE_ENG0_ADDR_RANGE_LO32` | `0x08a7` |
+| `VM_INVALIDATE_ENG0_ADDR_RANGE_HI32` | `0x08a8` |
+
+(gem5 already defines `MI300X_VM_INVALIDATE_ENG17_ACK = 0x08a6` = `0x0895 + 17`, confirming the
+ENG stride and the gc_9_4_3 base.)
 
 Engines are strided (ENG1 = ENG0 + 1 dword for REQ/ACK/SEM; ADDR_RANGE strided by 2). `REQ`
 fields (shifts verified): `PER_VMID_INVALIDATE_REQ=0`, `FLUSH_TYPE=16`, `INVALIDATE_L2_PTES=18`,
