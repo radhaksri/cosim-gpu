@@ -204,11 +204,23 @@ several can run in parallel.
 3. **Gate:** `rocminfo` shows `gfx942:xnack+`; a trivial xnack+ kernel with pre-resident memory
    runs to completion (builds on S6).
 
-## Phase 2 — Fix interrupt delivery to guest RAM (prerequisite)
-1. Route `AMDGPUInterruptHandler` cookie + wptr writes through `cosimBridge->sendDmaWrite()` so
-   they land in `/dev/shm/cosim-guest-ram` (`interrupt_handler.cc:152-168`). Scope confirmed by S1.
-2. **Gate:** guest `/proc/interrupts` increments and IH `RPTR` advances on CP_EOP — a clean,
-   independently verifiable fix (also unblocks normal interrupt-driven operation).
+## Phase 2 — Interrupt delivery to guest RAM — **NOT NEEDED (verified)**
+**Original premise was a misdiagnosis.** The IH writes the cookie/wptr via gem5's `DmaDevice`
+port (`interrupt_handler.cc:148,165`). That port (`device_ih`) is wired through
+`system._dma_ports` → `system.ruby.create(...)` into gem5's system memory
+(`configs/example/gpufs/mi300_cosim.py:257,272,405`), and that memory is
+`system.shared_backstore = /cosim-guest-ram` with `auto_unlink_shared_backstore = True`
+(`mi300_cosim.py:321-322`) — i.e. gem5's system RAM is mmap-backed by the **same** shmem QEMU
+exposes as guest RAM, with matching mem_ranges. So `dmaWrite(guest_phys)` already lands in
+guest-visible RAM; CP_EOP/SDMA interrupts work through this path today, and Phase 3's VM-fault
+cookie will use the same working path with no DMA plumbing changes.
+
+The bridge's `sendDmaWrite()`/`sendDmaRead()` (0x85/0x84) are unused dead code; `DmaReq` (0x05)
+only services VRAM. None of that is on the interrupt path — do not reroute the IH through it.
+
+**Residual check (cheap, runtime):** when a cosim is next booted, confirm guest
+`/proc/interrupts` increments / IH `RPTR` advances on a CP_EOP, to validate by observation what is
+here established by construction. This is the only remnant of old spike S1.
 
 ## Phase 3 — VM-fault registers + IH plumbing in gem5 (conform to S4 contract)
 1. Implement `VM_L2_PROTECTION_FAULT_CNTL/STATUS/ADDR_LO32/HI32` in `amdgpu_vm.*` at the **exact
@@ -252,8 +264,9 @@ several can run in parallel.
 - **R1 — timing-model park (reduced by S5):** gem5 may assume bounded translation latency; watch
   coalescer/outstanding-request accounting for deadlock. Settled deterministically by S5 before
   Phase 4.
-- **R2 — IH→guest-RAM DMA bug (S1, Phase 2):** may be a real pre-existing defect also blocking
-  normal interrupts.
+- **R2 — IH→guest-RAM DMA — RESOLVED/ELIMINATED:** verified not a bug; gem5 system memory is
+  `shared_backstore`-mapped to the guest-RAM shmem, so IH `dmaWrite` already reaches the guest.
+  No Phase 2 work needed (see Phase 2 section).
 - **R3 — PTE coherence (S8, Phase 5):** if KFD installs PTEs via a path that bypasses
   `vramShmem`, re-walks won't see them.
 - **R4 — hostcall (S7):** required for ASAN reporting; may itself depend on demand paging.
@@ -270,6 +283,11 @@ Run **Phase 0 in full**, prioritizing **S1, S2, S4** (they settle the unmodified
 and the interrupt-delivery question that gate everything downstream) and **S5** (de-risks the
 core mechanism). Re-scope Phases 1–6 against the recorded results before committing production
 code.
+
+**Progress (updated):** S4 complete (see `xnack-s4-fault-contract.md`). S1's interrupt-delivery
+question resolved statically — Phase 2 eliminated (`shared_backstore`). Next real work is
+**Phase 3** (VM-fault registers + cookie), now fully specified by S4. S5 (park/retry microspike)
+and the remaining live spikes (S2/S6/S7/S8) still want a booted cosim.
 
 ## References (verbatim anchors)
 
