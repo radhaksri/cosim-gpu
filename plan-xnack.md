@@ -397,6 +397,36 @@ paging — works**, which is what device-ASAN shadow accesses (loads from host-r
 Read-only managed access and resident `hipMalloc` workloads work. The unresolved case is **writes to
 demand-paged managed memory** (RMW), which is a secondary path for typical ASAN usage.
 
+### BREAKTHROUGH: the real blocker was a VMID mismatch (fixed)
+The earlier "best_loc=-1 / driver won't map it" conclusion was a symptom, not the root cause. With a
+driver-instrumented build (throwaway `pr_err` in `svm_range_best_restore_location`) the true cause
+surfaced: `svm_range_restore_pages` bailed at **`kfd node does not exist node_id:0 vmid:1`**
+(`kfd_node_by_irq_ids` → NULL), *before* `best_restore_location`.
+
+- gem5 raises faults with **VMID 1** (vega/tlb.cc hardcodes `getPageTableBase(1)`), but KFD reserves
+  VMIDs **8–15** for compute (`compute_vmid_bitmap = ((1<<16)-1) - ((1<<first_kfd_vmid)-1) = 0xFF00`,
+  `first_kfd_vmid=8`). `kfd_irq_is_from_node()` requires `(compute_vmid_bitmap & (1<<vmid))`, so
+  VMID 1 never matches → restore never runs.
+- **Fix (committed):** `AMDGPUDevice::raiseVmFault` now reports a **KFD compute VMID** (8+) in the IH
+  cookie + fault-status register. svm restore is keyed by PASID
+  (`amdgpu_vm_handle_fault → xa_load(pasids,pasid)`), so the literal VMID only has to satisfy the
+  compute-vmid check; the PTE update targets the process's tables (which gem5 reads at VMID 1).
+- **Verified on a booted cosim:** `kfd node does not exist` gone; `best_restore_location` reached
+  with `bitmap_access=0x1` → `best_loc=gpuid`; the driver **migrates the page to writable VRAM** and
+  gem5's walker **sees the writable VRAM PTE** (`PTE=0x2000003ee5d8065 writable=1`) after the
+  retry-CAM doorbell. So driver-side fault handling **and** migrated-PTE coherence now work.
+
+**Remaining (secondary):** the managed-RMW kernel still hangs after the data page is handled, with a
+single retry-CAM doorbell and one **GART sink** (`amdgpu_vm.cc`, the unconverted DMA/GART
+translation path, vaddr in the `0x7fff…` system aperture). The likely remaining blocker is the
+**completion-signal / GART access being sunk** (write lost → `hipDeviceSynchronize` never sees
+completion). That GART/SDMA path is a separate sink not yet converted to recoverable faults — the
+next item. The compute write-protect path itself is now correct (page migrates writable; the write
+no longer faults).
+
+**(Earlier "not gem5-fixable" assessment is superseded** — the VMID mismatch WAS gem5-fixable, and
+the migrate-on-write path now works; only the GART/completion sink remains.)
+
 ## References (verbatim anchors)
 
 - xnack hardware contract: `AMDGPUUsage.rst:817-828`; `GCNHazardRecognizer.cpp:717-725`.
