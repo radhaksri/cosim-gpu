@@ -427,6 +427,30 @@ no longer faults).
 **(Earlier "not gem5-fixable" assessment is superseded** — the VMID mismatch WAS gem5-fixable, and
 the migrate-on-write path now works; only the GART/completion sink remains.)
 
+### Remaining issue isolated to the GART/DMA path (separate sub-system)
+With park/done tracing (`WPARK`/`WDONE`) the compute path is confirmed fully working:
+- A not-present compute translation parks (`WPARK vaddr=0x79ffcc800000`) and **completes** after the
+  driver restore + retry-CAM doorbell (`WDONE`, same vaddr). No outstanding park, no walker sink.
+- **Resident `hipMalloc` kernel runs correctly under xnack+** (`RES sync=no error: 100..107`) with no
+  GART sink — so the compute-side recoverable-fault loop is solid.
+
+The **managed-RMW kernel hangs at `hipDeviceSynchronize`**, correlated with a **GART sink**:
+`GART cosim: unmapped page vaddr=0x7fff00404700 → sink` (`amdgpu_vm.cc` GARTTranslationGen). This is
+the **single-level GART/GTT translation** used by DMA/CP for system-aperture access (an SVM/completion
+GTT page specific to the managed path; resident kernels never hit it). The lookup misses the PTE
+(neither `gartTable` nor the VRAM-shmem fallback finds it) and sinks to paddr 0 → the access returns
+garbage → host sync never completes.
+
+This is a **separate sub-system** from the compute walker. The existing code comments note that
+*faulting* on the GART path "causes an infinite DMA retry loop that crashes gem5", so converting it
+to recoverable faults is non-trivial. Two avenues for the next step: (a) figure out why the GART PTE
+for this page is missing (driver writes it but gem5's `gartTable`/offset calc misses it → a lookup
+fix, no faulting needed), or (b) give the GART/DMA path the same park/retry treatment as the walker.
+
+**Status:** compute-side xnack+ recoverable faults (not-present demand paging + migrate-on-write)
+fully working and validated — this is what device-ASAN shadow demand-paging needs. Resident workloads
+pass. The one remaining gap is the GART/DMA translation sink on the managed-RMW completion path.
+
 ## References (verbatim anchors)
 
 - xnack hardware contract: `AMDGPUUsage.rst:817-828`; `GCNHazardRecognizer.cpp:717-725`.
