@@ -313,6 +313,26 @@ All gating spikes pass (S2, S6, retry-arming, S5). Implement Phase 4 per `xnack-
 S3 dropped (blob already xnack+). S7 still pending but does not gate Phase 4 (it gates ASAN
 reporting in Phase 6).
 
+### Phase 4 status: gem5 side WORKING to the driver boundary; Phase 5 is the blocker
+Implemented + boot-tested (managed-memory kernel). The gem5 half of the loop is validated against
+the unmodified ROCm 7.0 driver:
+- Compute access to an unmapped page → `raiseVmFault` → IH UTCL2 cookie + GFXHUB fault registers.
+- The driver decodes it correctly: `[gfxhub0] retry page fault (src_id:0 vmid:1 pasid:32769)
+  IH client 0x1b (UTCL2)`, and reads back `VM_L2_PROTECTION_FAULT_STATUS:0x00100000` (vmid 1<<20,
+  exactly what `setFaultStatus` wrote). Interrupt delivery + cookie + fault-reg readback all good.
+
+Two non-obvious fixes were required (single-GC model of a multi-hub/multi-XCC GPU):
+1. Capture CONTEXT*_CNTL / FAULT_CNTL / VM_INVALIDATE REQ **only via the GRBM (GFXHUB) aperture**
+   (`writeMMIOGfx940Fault`) — else MMHUB writes at the same dword offsets clobber them.
+2. **Sticky** retry-arming per VMID (`contextRetryArmed`) — MI300X's 8 XCDs each program GFXHUB
+   CONTEXT*_CNTL, aliasing onto one gem5 register; later instance writes were clearing retry.
+
+**Blocker (Phase 5):** the driver's `svm_range_restore_pages` then *fails* to fix the mapping in
+cosim, so the parked walk never resolves and the kernel hangs. Need to investigate why SVM restore
+fails (managed-memory range setup? migration target?) and ensure the driver's PTE write-back lands
+in the `vramShmem` the walker reads. Until then, fault→interrupt→driver works but the loop does not
+close. The separate GART sink (`amdgpu_vm.cc`) is also still a sink (not converted to recoverable).
+
 ## References (verbatim anchors)
 
 - xnack hardware contract: `AMDGPUUsage.rst:817-828`; `GCNHazardRecognizer.cpp:717-725`.
