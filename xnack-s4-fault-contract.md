@@ -14,14 +14,17 @@ and `gc_9_4_2_sh_mask.h` (the gfx942 GC register definitions present in the clon
 | GC VML2 fault registers (offsets + fields) | **Verified locally** | `gc_9_4_2_*` headers |
 | Retry-fault arming bit | **Verified locally** | `gc_9_4_2_sh_mask.h` |
 | VM invalidate (retry trigger) registers | **Verified locally** | `gc_9_4_2_offset.h` |
-| IH client IDs / fault source IDs | **NOT in clone** — need Linux amdgpu tree | `soc15_ih_clientid.h`, `soc15_int.h` |
-| IV cookie `src_data` layout read by ISR | **NOT in clone** — need `gmc_v9_0.c` | kernel `gmc_v9_0_process_interrupt` |
-| Fault-address encoding in ADDR_LO32/HI32 | **Inferred** (standard gfx9) — confirm vs `gmc_v9_0.c` | — |
+| IH client IDs / fault source IDs | **Verified** | amdgpu-dkms 6.14.14 `soc15_ih_clientid.h`, `irqsrcs_vmc_1_0.h` |
+| IV cookie layout read by ISR | **Verified** | amdgpu-dkms `soc15_int.h`, `gmc_v9_0.c:543-672` |
+| Fault-address encoding | **Verified** | `gmc_v9_0.c:562-563` |
 
-The amdgpu kernel driver C sources are **not** present in the clones (only register headers via
-rocprofiler-sdk). gem5's existing `dev/amdgpu/interrupt_handler.hh` client-ID enum (RLC, SDMA0-7,
-GRBM_CP) is the in-tree authority that already interoperates with the driver for CP/SDMA
-interrupts — extend it using the kernel's `soc15_ih_clientid.h` values.
+Driver sources obtained by extracting the exact in-guest driver package:
+`amdgpu-dkms_6.14.14.30100000-2204008.24.04_all.deb` from
+`repo.radeon.com/amdgpu/7.0/ubuntu` (matches the disk image's apt repo). Unpacked under
+`../amdgpu-dkms-src/extracted/usr/src/amdgpu-6.14.14-2204008.24.04/` (outside the git repos).
+gem5's existing `dev/amdgpu/interrupt_handler.hh` client-ID enum (RLC, SDMA0-7, GRBM_CP) is the
+in-tree authority that already interoperates with the driver for CP/SDMA — extend it with the
+values below.
 
 ## 1. GC VML2 fault registers (verified)
 
@@ -94,26 +97,65 @@ fields (shifts verified): `PER_VMID_INVALIDATE_REQ=0`, `FLUSH_TYPE=16`, `INVALID
 invalidate PWC + matching TLB entries, re-run parked WalkerStates, then set `ACK`** so the driver's
 poll completes.
 
-## 4. Still required from the Linux amdgpu tree (S4 follow-up)
+## 4. IH interrupt cookie for a recoverable VM fault (verified)
 
-Obtain these small headers/functions from the in-guest driver version (the apt `amdgpu-dkms`
-built from the kernel; matches the disk image's ROCm 7.0 / kernel 6.8.0-79):
+### Client/source IDs the driver listens on (`gmc_v9_0.c:1959-1971`)
+The driver registers three VM-fault sources:
+| client_id | src_id | hub (in ISR) |
+|---|---|---|
+| `SOC15_IH_CLIENTID_VMC` = **0x12** | `VMC_1_0__SRCID__VM_FAULT` = **0** | mmhub0 |
+| `SOC15_IH_CLIENTID_VMC1` (=PCIE0) | 0 | mmhub1 |
+| `SOC15_IH_CLIENTID_UTCL2` = **0x1b** | `UTCL2_1_0__SRCID__FAULT` = **0** | **gfxhub0** |
 
-1. `soc15_ih_clientid.h` → `SOC15_IH_CLIENTID_VMC`, `_VMC1`, `_UTCL2` (the client IDs gem5's IH
-   cookie must carry; extend `interrupt_handler.hh`).
-2. Fault **source IDs** (e.g. `VMC_1_0__SRCID__VM_FAULT`) the ISR matches on.
-3. `gmc_v9_0_process_interrupt` (`drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c`) → the exact IV
-   `src_data[0/1]` fields it reads (fault status + address packing) and which hub it attributes the
-   fault to (GC VML2 vs MMHUB). This defines the cookie `source_data_dw*` gem5 must fill in
-   `prepareInterruptCookie`.
-4. Confirm the ADDR register encoding (§1) and the per-context retry arming sequence (§2).
+**A compute-shader / GC-L2 fault (where ASAN shadow accesses fault) must use
+`client_id = SOC15_IH_CLIENTID_UTCL2 (0x1b)`, `src_id = 0`** → the ISR's `else` branch attributes
+it to gfxhub0 (`gmc_v9_0.c:571-580`). VMC (0x12) would be misrouted to MMHUB.
 
-These cannot be guessed without breaking the unmodified-driver constraint — they gate Phase 3
-cookie population and Phase 4 fault attribution. Recommended: copy these four items out of the
-exact kernel source the guest runs, or capture them live via MMIO/IH tracing in spikes S1/S5.
+### IV wire entry = 8 dwords (`soc15_int.h:38-48`); decode maps `dword[4+i] → src_data[i]`
+| dword | contents |
+|---|---|
+| `dw[0]` | `[7:0]`=client_id, `[15:8]`=src_id, `[23:16]`=ring_id, `[27:24]`=vmid, `[31]`=vmid_type |
+| `dw[1],dw[2]` | timestamp |
+| `dw[3]` | `[15:0]`=pasid, `[23:16]`=node_id |
+| `dw[4]` = src_data[0] | `addr >> 12` (low 32 bits of faulting page) |
+| `dw[5]` = src_data[1] | `[3:0]`=addr bits `[47:44]`; **bit 5 = write_fault**; **bit 7 = retry_fault** |
+| `dw[6]` = src_data[2] | `[9:0]` = retry-CAM index (only if retry-CAM enabled) |
+| `dw[7]` = src_data[3] | — |
+
+### Decode logic (`gmc_v9_0.c:547-563,665-668`)
+```
+retry_fault = src_data[1] & 0x80      // bit 7  -> MUST be set for recoverable fault
+write_fault = src_data[1] & 0x20      // bit 5
+addr = ((u64)src_data[0] << 12) | (((u64)src_data[1] & 0xf) << 44)
+// after the interrupt, driver also RREG32s VM_L2_PROTECTION_FAULT_STATUS for CID/RW/FED
+```
+On a retry fault the ISR calls `amdgpu_vm_handle_fault(pasid, vmid, node_id, addr, ts, write_fault)`
+→ `svm_range_restore_pages` fills the page tables (the demand-paging fix), then a VM invalidate
+(§3) is issued. So **gem5's cookie must carry the real faulting PASID and GPU VMID** (the current
+`prepareInterruptCookie` hardcodes `pasid=0x8000` and zeroes vmId — both must be set correctly).
+
+### gem5 work (Phase 3)
+1. Extend `interrupt_handler.hh` client enum with `UTCL2=0x1b` (and `VMC=0x12`); add src_id 0;
+   relax the asserts in `prepareInterruptCookie`.
+2. Populate the cookie: client=0x1b, src=0, vmid=<faulting VMID>, pasid=<faulting PASID>,
+   node_id=0 (single-AID), src_data[0]=addr>>12, src_data[1]=`(addrhi&0xf) | (write<<5) | (1<<7)`.
+3. Also fill `VM_L2_PROTECTION_FAULT_STATUS` (§1) with matching VMID/RW/CID so the ISR's
+   post-interrupt RREG32 is consistent.
+
+### Runtime caveat to confirm (spike S1/S5)
+`gmc_v9_0.c:584` branches on `adev->irq.retry_cam_enabled`. If the guest enables the retry-CAM,
+the driver expects to write a CAM doorbell (`WDOORBELL32(retry_cam_doorbell_index, cam_index)`,
+line 597) and reads `cam_index` from `src_data[2]`. Simplest for gem5 is the **non-CAM path**
+(lines 600-620: filter + `amdgpu_vm_handle_fault` + delegate to soft ring 8). Confirm whether
+gfx942 turns retry-CAM on in this driver build; if so, gem5 must supply a valid `src_data[2]`
+index and honor the CAM doorbell.
 
 ## Phase mapping
 - §1 STATUS/ADDR/CNTL registers → **Phase 3** (implement readable regs in `amdgpu_vm.*`).
 - §2 retry arming → **Phase 3/4** (observe CNTL writes; gate recoverable faults).
 - §3 invalidate → **Phase 4** (retry trigger + ACK).
-- §4 IH IDs/cookie → **Phase 3** (blocked on kernel headers).
+- §4 IH IDs/cookie → **Phase 3** (now fully specified; no blockers).
+
+S4 is complete: the full driver-facing contract is verified against the exact in-guest driver
+(amdgpu-dkms 6.14.14). Only one runtime detail (retry-CAM on/off, §4 caveat) needs confirmation on
+a booted cosim.
