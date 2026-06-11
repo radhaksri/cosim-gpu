@@ -372,6 +372,31 @@ or compare the range's attributes against real hardware. Until then RMW managed 
 complete; read-only managed access and resident (`hipMalloc`) workloads work. (Current code degrades
 gracefully — warn+drop — instead of crashing.) The separate GART sink (`amdgpu_vm.cc`) is unchanged.
 
+### Update: write-protect is NOT fixable in gem5 — confirmed (driver provides no mapping)
+Further investigation closed this out:
+- **HMM/SVM is supported** in the guest: boot dmesg shows `HMM registered 16384MB device memory`, so
+  `pgmap.type != 0` → `KFD_IS_SVM_API_SUPPORTED` true → `bitmap_supported` includes the GPU. (So
+  it's not an empty-`bitmap_supported` problem.)
+- Migration + SDMA PTE-writes work for ranges the driver grants the GPU access to. But for the
+  fault-created managed range the driver returns `best_loc=-1` and installs a **PRT placeholder PTE**
+  (`0x8000000000003`, bit 51 = `AMDGPU_PTE_PRT`) — i.e. **no real GPU mapping exists** for that page.
+- Consequence: there is **no valid physical address for gem5 to complete the write**. Both attempted
+  gem5 workarounds crash the simulator: writing the PRT paddr (huge, invalid) segfaults gem5;
+  sinking the compute write to paddr 0 also segfaults (paddr 0 is only a safe sink in the DMA/GART
+  path, not through the Ruby/L2 compute path). The **only** non-crashing behavior is graceful
+  warn+drop (the access never completes → that wavefront hangs, but the sim survives).
+- **Conclusion:** RMW on fault-created managed ranges cannot be made correct in gem5 — the driver
+  never creates a mapping to write to. This is a driver/runtime SVM-attribute decision (the GPU is
+  excluded from the range's access bitmap) that the cosim cannot satisfy from the gem5 side. A real
+  fix requires understanding why the runtime/driver excludes the GPU for these ranges (driver-
+  instrumented build dumping the range bitmaps + the `SET_ATTR` calls + the topology the runtime
+  sees), and may be an inherent cosim KFD-topology limitation.
+
+**Net for the project goal (ASAN):** the core recoverable-fault mechanism — **not-present demand
+paging — works**, which is what device-ASAN shadow accesses (loads from host-resident shadow) need.
+Read-only managed access and resident `hipMalloc` workloads work. The unresolved case is **writes to
+demand-paged managed memory** (RMW), which is a secondary path for typical ASAN usage.
+
 ## References (verbatim anchors)
 
 - xnack hardware contract: `AMDGPUUsage.rst:817-828`; `GCNHazardRecognizer.cpp:717-725`.
