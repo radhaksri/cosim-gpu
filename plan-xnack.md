@@ -327,11 +327,33 @@ Two non-obvious fixes were required (single-GC model of a multi-hub/multi-XCC GP
 2. **Sticky** retry-arming per VMID (`contextRetryArmed`) — MI300X's 8 XCDs each program GFXHUB
    CONTEXT*_CNTL, aliasing onto one gem5 register; later instance writes were clearing retry.
 
-**Blocker (Phase 5):** the driver's `svm_range_restore_pages` then *fails* to fix the mapping in
-cosim, so the parked walk never resolves and the kernel hangs. Need to investigate why SVM restore
-fails (managed-memory range setup? migration target?) and ensure the driver's PTE write-back lands
-in the `vramShmem` the walker reads. Until then, fault→interrupt→driver works but the loop does not
-close. The separate GART sink (`amdgpu_vm.cc`) is also still a sink (not converted to recoverable).
+**Phase 5 status — not-present loop CLOSED; write-protect is the frontier.**
+Committed (`e82ea35`). Boot-tested against unmodified ROCm 7.0 with a managed-memory kernel.
+
+Three fixes were needed to close the loop:
+1. **Retry trigger = retry-CAM doorbell, not VM_INVALIDATE.** GC 9.4.3 enables the retry-CAM
+   (`vega20_ih.c`), so after fixing a fault the driver rings the retry-CAM doorbell (offset 0xd18)
+   to signal retry — gem5 didn't recognize it. Route unknown doorbell writes (and VM_INVALIDATE
+   REQ) to `retryAllParkedWalks()`.
+2. **Deferred retry.** Re-walking synchronously from inside the doorbell/MMIO handler re-enters the
+   walk/TLB/CU stack and crashes QEMU. `retryParkedWalks()`/`retryParkedWrites()` now only schedule
+   an event; the re-walk runs off the event queue.
+3. **Write-protect park (HMM read-then-write).** The FS page walk is issued as Read (`tlb.cc`), so
+   the walker can't see write mode; a write to a driver-mapped read-only page is detected in
+   `GpuTLB::handleTranslationReturn`, raises a write fault, and parks at the TLB layer (re-issued on
+   the retry trigger with PWC/TLB flush; same-page in-flight accesses deferred to avoid duplicate
+   return events).
+
+**Working:** not-present demand fault → IH UTCL2 cookie → driver `svm_range_restore_pages` → CAM
+doorbell → deferred re-walk → resolved. Validated.
+
+**Frontier (next):** the write-protect path's driver **migrate-on-write does not take effect** in
+the re-walk. The faulting PTE is a *system* read-only PTE (`0x8000000000003`); the driver should
+migrate the page to VRAM and install a writable VRAM PTE (`0x2...075`, seen for other ranges), but
+every retry re-reads the RO PTE until the cap (`kMaxWriteRetries`, currently panics). Open
+questions: does the driver attempt migration on the write fault in cosim? does it write a new PTE
+(SDMA) and does it land in the `vramShmem` the walker reads? or is it a timing gap (retry fires
+before the SDMA PTE write is visible)? The separate GART sink (`amdgpu_vm.cc`) is also still a sink.
 
 ## References (verbatim anchors)
 
