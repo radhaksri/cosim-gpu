@@ -284,10 +284,18 @@ and the interrupt-delivery question that gate everything downstream) and **S5** 
 core mechanism). Re-scope Phases 1–6 against the recorded results before committing production
 code.
 
-**Progress (updated):** S4 complete (see `xnack-s4-fault-contract.md`). S1's interrupt-delivery
-question resolved statically — Phase 2 eliminated (`shared_backstore`). Next real work is
-**Phase 3** (VM-fault registers + cookie), now fully specified by S4. S5 (park/retry microspike)
-and the remaining live spikes (S2/S6/S7/S8) still want a booted cosim.
+**Progress (updated):**
+- S4 complete (see `xnack-s4-fault-contract.md`).
+- S1 resolved statically — Phase 2 eliminated (`shared_backstore`).
+- Phase 3 implemented + compiles (gem5 `gem5.opt` links clean).
+- **S2 PASS (on booted cosim):** with `HSA_XNACK=1`, `rocminfo` reports
+  `gfx942:sramecc-:xnack+` / `XNACK enabled: YES`. The discovery blob already supports xnack+ —
+  **S3 (blob patch) NOT needed.** BUT: exporting `HSA_XNACK` only in `cosim-gpu-setup.sh` does not
+  reach login/GPU processes (it was empty in the guest shell → xnack-). Fixed by writing
+  `HSA_XNACK=1` to `/etc/environment` in `rocm-install.sh` (needs a disk rebuild to bake in; can be
+  set live with `export HSA_XNACK=1`).
+- Still TODO on the booted cosim: retry-arming check (does the driver set `VM_CONTEXT1_CNTL`
+  bit 7), **S5** (park feasibility, gates Phase 4), S6 (xnack+ kernel runs), S7 (hostcall).
 
 ## References (verbatim anchors)
 
