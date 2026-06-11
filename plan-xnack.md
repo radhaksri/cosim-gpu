@@ -347,13 +347,30 @@ Three fixes were needed to close the loop:
 **Working:** not-present demand fault → IH UTCL2 cookie → driver `svm_range_restore_pages` → CAM
 doorbell → deferred re-walk → resolved. Validated.
 
-**Frontier (next):** the write-protect path's driver **migrate-on-write does not take effect** in
-the re-walk. The faulting PTE is a *system* read-only PTE (`0x8000000000003`); the driver should
-migrate the page to VRAM and install a writable VRAM PTE (`0x2...075`, seen for other ranges), but
-every retry re-reads the RO PTE until the cap (`kMaxWriteRetries`, currently panics). Open
-questions: does the driver attempt migration on the write fault in cosim? does it write a new PTE
-(SDMA) and does it land in the `vramShmem` the walker reads? or is it a timing gap (retry fires
-before the SDMA PTE write is visible)? The separate GART sink (`amdgpu_vm.cc`) is also still a sink.
+**Frontier (next): write-protect / migrate-on-write — root-caused to a driver SVM decision.**
+Investigated with amdgpu dynamic debug (`kfd_svm.c`, `kfd_migrate.c`). Findings:
+- Migration + SDMA PTE-write **work**: large prefetched/runtime ranges migrate to VRAM and the
+  driver installs writable PTEs (`sdma copy memory fence done`; `map [...] vram 1 PTE
+  0x200000000000075`). So the cosim's SDMA, ZONE_DEVICE/pgmap, and PTE delivery are fine — this is
+  **not** a gem5 PTE-coherence bug.
+- The stuck page is a **fault-created single-page managed range** (e.g. `[0x78d0d1f93]`, the test's
+  `a` buffer). For it the driver logs `xnack 1 ... best loc 0xffffffff` (SVM_LOC_UNDEFINED) and
+  `restore ... done, r=0` with **no `map` line** — it never maps/migrates it, so it stays
+  system-RO and every retry re-faults until the cap.
+- Root cause: `svm_range_best_restore_location` (`kfd_svm.c`) returns `-1` when the faulting
+  `*gpuidx` is in **neither** `prange->bitmap_access` nor `bitmap_aip`. KFD topology is a single
+  GPU (node 1, `gpu_id=0x43a1`), and the *working* ranges resolve `best_loc=0x43a1` with the same
+  fault `node_id=0`/`vmid=1`, so `*gpuidx` resolution is consistent — the difference is the
+  **range's access bitmap**: this range grants the GPU no access.
+
+Open question / next step: why does this single-page range have the GPU excluded from its access
+bitmap while sibling ranges include it? Candidates: (a) the runtime registered it via SET_ATTR with
+restricted/host-only access (fine-grained/coherent alloc), or (b) a cosim KFD-topology quirk makes
+the runtime grant access to a different gpuidx. **To distinguish, instrument the driver's
+`best_loc==-1` return to dump `bitmap_access`/`bitmap_aip` and `*gpuidx`** (throwaway driver build),
+or compare the range's attributes against real hardware. Until then RMW managed workloads can't
+complete; read-only managed access and resident (`hipMalloc`) workloads work. (Current code degrades
+gracefully — warn+drop — instead of crashing.) The separate GART sink (`amdgpu_vm.cc`) is unchanged.
 
 ## References (verbatim anchors)
 
