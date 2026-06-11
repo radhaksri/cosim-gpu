@@ -451,6 +451,24 @@ fix, no faulting needed), or (b) give the GART/DMA path the same park/retry trea
 fully working and validated — this is what device-ASAN shadow demand-paging needs. Resident workloads
 pass. The one remaining gap is the GART/DMA translation sink on the managed-RMW completion path.
 
+### GART "lookup fix" investigated — does NOT apply (it's a routing issue, not a missing PTE)
+Instrumented `GARTTranslationGen::translate` to dump lookups (`P8DBG`). Findings:
+- The GART lookup/fallback **works correctly** for in-aperture addresses: successful translations are
+  at `vaddr=0x3fff8xxxxxxx` (`gart_addr ≥ ptStart*8 = 0x3fff800000`), and the VRAM-shmem fallback
+  reads a valid PTE (`vram1off = gartBase + (gart_addr - ptStart*8)`, in range). No bug there.
+- The sinking address **`0x7fff00404700`** has `gart_addr=0x7fff00420`, which is **far below** the
+  GART aperture base (`ptStart*8=0x3fff800000`) and **outside** the GART table coverage
+  (`ptStart..ptEnd = 0x7fff00000..0x7fff1ffff`). It is a **host user VA** (classic Linux mmap/SVM
+  address) — not a `gartTable` key/offset mismatch.
+- Conclusion: the PTE isn't "missing from the table"; this **SVM/host VA is being routed through the
+  GART path at all**, when it should be translated via the user VM (the compute walker / VMID 1 page
+  tables that already work). So **option 1 (lookup fix) does not apply.**
+
+Next step is therefore NOT a lookup fix but one of: (a) trace the **requestor** of the
+`0x7fff00404700` access (which engine — CP/SDMA — and why it uses GART vs user-VM addressing) to see
+if it's a routing fix, or (b) the larger option 2 (recoverable faults on the GART/DMA path, which the
+code warns risks an infinite DMA-retry crash). Core goal (compute-side xnack+) remains met.
+
 ## References (verbatim anchors)
 
 - xnack hardware contract: `AMDGPUUsage.rst:817-828`; `GCNHazardRecognizer.cpp:717-725`.
