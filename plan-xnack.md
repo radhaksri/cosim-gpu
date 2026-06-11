@@ -294,8 +294,24 @@ code.
   reach login/GPU processes (it was empty in the guest shell → xnack-). Fixed by writing
   `HSA_XNACK=1` to `/etc/environment` in `rocm-install.sh` (needs a disk rebuild to bake in; can be
   set live with `export HSA_XNACK=1`).
-- Still TODO on the booted cosim: retry-arming check (does the driver set `VM_CONTEXT1_CNTL`
-  bit 7), **S5** (park feasibility, gates Phase 4), S6 (xnack+ kernel runs), S7 (hostcall).
+- **S6 PASS:** a `gfx942:xnack+` HIP kernel compiled and ran correctly through the cosim GPU
+  (`RESULT: 100..107`) — gem5 executes the xnack codegen (`_ec` opcodes / reserved `s[104:105]`).
+- **Retry-arming PASS:** the stock driver writes `VM_CONTEXT1..15_CNTL = 0x5554cd` with retry bit 7
+  set on all user contexts (context 0 = system, bit 7 clear). So `raiseVmFault`'s
+  `retryFaultEnabled()` gate is satisfied — Phase 4 faults will actually fire. (Confirmed even with
+  the stripped init: `ip_block_mask=0x67`, PSP/SMU off.)
+- **S5 PASS (gates Phase 4 / clears R1):** with a throwaway patch delaying 4 translation responses
+  by 10 µs each, the kernel still returned the correct result — the CU/coalescer tolerate parked
+  translations without deadlock or corruption. **The translation-layer park-and-retry approach is
+  viable; Phase 4 is GO.**
+- Note: default cosim backend is **vfio-user** (not the legacy socket); `shared_backstore` (and
+  thus the Phase 2 IH-DMA conclusion) holds for both backends.
+- Remaining live spike: **S7** (hostcall / device printf) — needed for ASAN reporting; not yet run.
+
+### Verdict: Phase 4 unblocked
+All gating spikes pass (S2, S6, retry-arming, S5). Implement Phase 4 per `xnack-phase4-draft.md`.
+S3 dropped (blob already xnack+). S7 still pending but does not gate Phase 4 (it gates ASAN
+reporting in Phase 6).
 
 ## References (verbatim anchors)
 
