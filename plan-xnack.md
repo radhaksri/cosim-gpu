@@ -997,6 +997,23 @@ Net: the dominant nondeterministic model death is fixed; the full suite now runs
 completion. Remaining divergences from MI325 are unchanged by this (cross-test corruption in the
 single-process suite; MemoryAccessCoherent data-verify; the rare mode-2 fatal).
 
+### Crash cluster mode 2 FIXED (not-present SDMA functional walk) — gem5 7655fffae0
+Root cause: `UserTranslationGen::translate` did a functional (synchronous) walk for an SDMA/DMA
+access; on a not-present user page (demand-paged under xnack) it `fatal()`'d. Crucially, for a user
+SDMA queue (vmid>0) even the ring/packet fetch (`decodeNext` -> `dmaReadVirt(q->rptr())`) routes
+through `SDMAEngine::translate` -> `UserTranslationGen`, so a not-present RING page also hit this. The
+earlier sink-to-0 attempt turned the fatal into a `panic: Invalid SDMA packet` (the sunk ring read as
+garbage). Two-part fix:
+- `amdgpu_vm.cc` `UserTranslationGen::translate`: on not-present, advance one page + sink to paddr 0
+  (mirroring the GART path's established cosim behavior) instead of `fatal()`.
+- `sdma_engine.cc` `decodeHeader` default: on an unknown opcode (e.g. a sunk garbage ring), warn and
+  drain the queue (rptr=wptr) + decodeNext, instead of `panic`.
+**Validated:** looping the memory-access tests exercised BOTH paths (`UserTranslationGen ... sink` and
+`SDMA invalid packet ... draining` each fired) and gem5 SURVIVED (0 panics/fatals, 7+ iterations); the
+full suite reaches the final ASAN abort. Both crash-cluster modes are now fixed (mode 1 = TLB flush
+`6f369001a3`; mode 2 = `7655fffae0`). Note: graceful degradation, not correctness — the affected DMA
+bytes may be wrong (so MemoryAccessCoherent still FAILS its data check), but the model no longer dies.
+
 **DECISION (2026-06-12, user):** Stop here — the core goal is met. Compute-side xnack+ recoverable
 demand paging (the ASAN device-shadow dependency) works and is validated; resident `hipMalloc` and
 managed-RMW *data correctness* work. The remaining **SDMA-walker teardown hang** on managed/SVM
