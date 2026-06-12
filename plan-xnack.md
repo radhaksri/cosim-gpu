@@ -469,6 +469,38 @@ Next step is therefore NOT a lookup fix but one of: (a) trace the **requestor** 
 if it's a routing fix, or (b) the larger option 2 (recoverable faults on the GART/DMA path, which the
 code warns risks an infinite DMA-retry crash). Core goal (compute-side xnack+) remains met.
 
+### Requestor traced → SDMA; routing fix lands the hang (committed `5d2dd1c`)
+Tracing (`SDMAEngine::translate`) showed the requestor is the **SDMA engine** with `cur_vmid == 0`
+(kernel SDMA queue) accessing the process's **user/SVM VAs** (`0x7fff…`). These were falling through
+to the GART aperture and sinking. The fault address packing confirms the VA is inside the GPUVM user
+aperture (vmContext0 `ptStart` stores a page-shifted base; `0x7fff00404700` sits at offset
+`0x404700` within `0x7fff00000000`), so the correct translation is the **GPUVM page-table walker**,
+not GART.
+
+**Fix (committed `5d2dd1c`):** `SDMAEngine::translate` now routes high canonical user VAs
+(`>= 0x700000000000`) through `UserTranslationGen` (vmid 1, the working compute walker) **when the
+page is present**. Presence is probed with a non-fatal functional walk first because the walker's
+functional path `fatal()`s on an unmapped page; if it faults, fall back to GART (prior behavior) so
+boot-time/transient unmapped accesses don't crash the model.
+
+**Result (booted cosim, unmodified ROCm 7.0, `/root/mgd` hipMallocManaged RMW):**
+- **Hang fixed:** `/root/mgd` now returns `EXIT=0`, `sync=no error` (was `EXIT=124` timeout). All
+  SDMA poll/copy user VAs that were blocking now resolve through the walker. Boot survives; no fatals;
+  resident/compute paths unaffected.
+- **Remaining data gap:** result is stale — `MRESULT: 0 1 2 3 4 5 6 7` instead of `100..107`. Exactly
+  **one** address still sinks, **once**: `0x7fff00404700`, the **device→host migration copy-back
+  destination** at `hipDeviceSynchronize`. Its GPUVM PTE (vmid 1) is **not present** at access time
+  (the page was migrated to VRAM for the kernel and its system PTE cleared), so the write-back sinks
+  and the host never sees the kernel's `+100`.
+
+### Open frontier: SDMA recoverable faulting (the copy-back write-back)
+Making that single copy-back land correctly requires the **SDMA engine to fault the not-present page
+in, let the driver restore it, and retry** — the SDMA analogue of the compute-walker park/retry that
+already works, but the SDMA translate path is **synchronous/functional** and would need restructuring
+to support async park-and-retry. The functional probe cannot demand-page. This is the next item
+(user-approved: "1, then 2" — ship the routing fix, then pursue SDMA recoverable faulting).
+**Core goal (compute-side xnack+ for device ASAN) is fully met and independent of this.**
+
 ## References (verbatim anchors)
 
 - xnack hardware contract: `AMDGPUUsage.rst:817-828`; `GCNHazardRecognizer.cpp:717-725`.
@@ -482,3 +514,104 @@ code warns risks an infinite DMA-retry crash). Core goal (compute-side xnack+) r
   `arch/amdgpu/vega/pagetable_walker.cc:213-222,443-472,514-521`;
   `dev/amdgpu/interrupt_handler.cc:68-118,152-168`; `dev/amdgpu/amdgpu_device.cc:888-897`;
   `dev/amdgpu/amdgpu_vm.cc:587`; `qemu/hw/misc/mi300x_gem5.c:197-216`.
+
+### Step 2 finding: SDMA recoverable faulting is implemented but NOT the blocker for managed RMW
+After shipping the routing fix (step 1), implemented SDMA park-and-retry (uncommitted): `userVaPresent()`
+probe, `parkIfNotPresent()` (raise recoverable VM fault + park the op continuation), `retrySdmaOps()`
+(re-run on the retry-CAM doorbell), guard on the `copyReadData` host-destination branch, and wiring in
+`AMDGPUDevice::writeDoorbell`.
+
+**An SDMA trace (`--gem5-debug SDMAEngine`) of `/root/mgd` (hipMallocManaged RMW) shows the mechanism
+never fires, because the premise was wrong:**
+- During the kernel+sync there are **zero SDMA Copy packets** (opcode 1 absent). The only SDMA traffic
+  is **PTEPDE** (page-table/PDE writes to VRAM `0x3ee5xx000`, `init:0 inc:4096 count:512` — mapping
+  pages), **Fence**, **rptr-writeback**, and small **Write** packets to page-table addresses.
+- The earlier suspect `0x7fff00404700` is a **boot-time** GART sink (`warn_once`, fires once during
+  setup); it is **never accessed during the mgd run** (0 occurrences after the run marker).
+- So the stale result (`MRESULT: 0 1 2 3 4 5 6 7`, not `100..107`) is **not** caused by a faulting
+  SDMA copy-back. There is **no host<->VRAM data migration copy at all** for the managed buffer. The
+  driver maps pages (PTEPDE) but no SDMA byte-copy moves the kernel's results back to the CPU-visible
+  system page, so the CPU `printf` reads the untouched system page.
+
+**Conclusion:** the managed-RMW correctness gap is an **absent/incomplete HMM data-migration** issue
+in the cosim (svm_migrate host<->VRAM byte copies don't occur for this allocation), a separate and
+deeper problem than SDMA recoverable faulting. The SDMA park/retry code is a sound mechanism for
+genuine SDMA copy faults but does not address this test. Hang fix (step 1, committed `5d2dd1c`) stands;
+resident `hipMalloc` and compute-side xnack+ (the ASAN goal) remain fully working.
+
+**Open (next): investigate why no `svm_migrate_copy_to_vram`/`_to_ram` SDMA copies occur** for the
+fault-created managed range under cosim (driver decision / ZONE_DEVICE migration path), vs. deciding
+whether managed-memory full coherence is in scope at all given the ASAN goal is already met.
+
+### CRITICAL CORRECTION: the booted disk is xnack-OFF (test regime was wrong)
+While investigating the missing migration, found that the running disk image has **no `HSA_XNACK` in
+`/etc/environment`** (`HSA_XNACK=` empty in the guest shell; `rocminfo` → `XNACK enabled: NO`, device
+`gfx942:...:xnack-`). The Phase 1 fix (`gem5-resources` commit `3d6d5123`, adds `HSA_XNACK=1` to
+`/etc/environment` in `rocm-install.sh`) is committed but **not baked into this disk** — the disk was
+not rebuilt since that commit (the 58GB raw image's recent mtime only reflects QEMU's read-write boot,
+not a Packer rebuild). **All `/root/mgd` runs this session were therefore xnack-OFF**, so the
+"hang fixed / EXIT=0" result was an xnack-OFF artifact, not a real managed-RMW fix.
+
+Driver dynamic-debug (`kfd_migrate.c`,`kfd_svm.c`) for the xnack-OFF run:
+`xnack 0 ... best loc 0xffffffff` → `Mapping range ... on domain: CPU` → `map ... vram 0 PTE
+0x600000000000067` (valid+system+snooped+readable+writable to guest-phys). I.e. the managed range is
+mapped **in place to system memory** (no VRAM migration, no SDMA copy) — consistent with the observed
+absence of SDMA Copy packets.
+
+With explicit `export HSA_XNACK=1` (the real target regime), `/root/mgd` **hangs** → GPU job timeout →
+`amdgpu_device_gpu_recover` → mode1 reset → **`psp_gpu_reset` NULL-deref kernel oops** (psp is disabled
+in cosim via `ip_block_mask`). This matches the *known* pre-existing managed-RMW hang in the plan; the
+managed-RMW path under xnack is still broken.
+
+**Ground-truth re-validation needed** (in the correct xnack-ON regime, with the committed routing fix
+`5d2dd1c` and disk rebuilt to bake in `HSA_XNACK=1`): (a) does resident `hipMalloc` still pass
+`100..107`? (b) does the routing fix change the managed-RMW hang at all? (c) is the managed-RMW hang
+the compute write-back path or something else. The committed routing fix remains a valid SDMA
+user-VA correctness improvement independent of the managed-RMW outcome.
+
+### Ground truth re-established (xnack-ON, committed binary 5d2dd1c, disk still xnack-off by default)
+Re-ran with explicit `export HSA_XNACK=1` (`XNACK enabled: YES`). Two clean reference points:
+
+- **Resident `hipMalloc` (compute path): CORRECT data** — `RRESULT: 100..107`. Confirms compute-side
+  xnack+ works. (Caveat: the process then hangs on **teardown** — `timeout` returns 124 *after* the
+  result prints. A process-exit/queue-teardown hang, separate from data correctness.)
+- **Managed `hipMallocManaged` RMW: WRONG data** — `MRESULT: 0 0 0 0 0 0 0 0` (committed/no-park
+  binary; completes, no GPU reset). With the earlier park binary it instead hung → GPU reset → oops,
+  so the SDMA park mechanism *caused* the hang; without it the op sinks and the run completes with
+  bad data. Same teardown hang (`MEXIT=124` after printing).
+
+Migration dmesg (`kfd_migrate.c`/`kfd_svm.c`) for the managed run shows the **full HMM cycle runs**:
+`switching xnack from 0 to 1`; ranges get `best loc 0x43a1` → `sdma copy memory fence done` →
+`Mapping range ... on domain: GPU` → `map ... vram 1 PTE 0x2000000000000_75` (host→VRAM migrate); the
+fault page `0x7a5b47e26` is restored to `vram 1`; then `CPU page fault ... address 0x7a5b47e26000` →
+`sdma copy memory fence done` → `CPU fault ... done` (VRAM→host migrate-back). The `P5DRV` probe shows
+`acc=0x1` (GPU granted access), `best_restore r=0`.
+
+**So the managed blocker is NOT "no migration" and NOT a driver access-bitmap decision** (both run
+correctly now). The migration **byte-copies complete but move zeros/garbage** — `MRESULT` all-zeros
+means even the CPU's initial `0..7` is gone after the round trip. The real bug is the **SDMA
+migration copy in gem5 not moving the correct bytes** for these SVM ranges.
+
+Note: xnack-ON SVM VAs are `~0x7a5xxxxxx` (≈30 GB), **below** the committed routing fix's threshold
+(`0x700000000000`), so that fix does not apply in the real regime — these copies go through GART. The
+routing fix remains valid only for the (artifactual) xnack-OFF `0x7fff…` addresses; it is harmless but
+not load-bearing for the actual managed-memory path.
+
+**Two distinct remaining issues, both in the xnack-ON regime:**
+1. **SDMA migration copy moves wrong data** (managed RMW → zeros). Next: SDMA-trace the migration
+   copies under xnack-ON; resolve source/dest translation for the ~30 GB SVM/dma-mapped addresses so
+   the bytes actually move (likely a GART/dma-addr resolution issue in the SDMA copy path).
+2. **Process-teardown hang** under xnack (resident *and* managed return 124 after printing correct/any
+   result). Independent of data correctness; likely queue/fault drain at process exit.
+
+Also: the default disk lacks `HSA_XNACK` — rebuild the disk (Packer re-runs `rocm-install.sh` with the
+committed Phase 1 fix `3d6d5123`) so default boots are xnack-ON, or always `export HSA_XNACK=1`.
+
+### SESSION PAUSE / follow-up marker (2026-06-11)
+State recorded above. Validated this session (xnack-ON, `export HSA_XNACK=1`): compute/resident
+`hipMalloc` → correct `100..107` (ASAN-relevant path works); managed RMW → all-zeros (SDMA migration
+copy moves wrong bytes) + teardown hang (124 after print). Committed: routing fix `5d2dd1c` (harmless,
+not load-bearing in real regime). Reverted: SDMA park/retry (caused GPU-reset hang). Open follow-ups:
+(1) SDMA migration copy data movement; (2) process-teardown hang; (3) rebuild disk to bake in
+`HSA_XNACK=1`. NEW direction: move to a base Ubuntu 24.04 backing disk + ROCm delta (qcow2 overlay)
+workflow before resuming the above.

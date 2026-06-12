@@ -1,0 +1,31 @@
+{
+  "layers_dir": "gem5-resources/src/x86-ubuntu-gpu-ml/layers",
+  "base": {
+    "ubuntu": "24.04.2"
+  },
+  "kernel": {
+    "version": "6.8.0-79-generic"
+  },
+  "driver": {
+    "amdgpu_repo_ver": "7.0"
+  },
+  "rocm": {
+    "source": "therock-asan",
+    "amdgpu_family": "gfx94X-dcgpu",
+    "tests": true,
+    "components": "",
+    "therock_repo": "ROCm/TheRock",
+    "therock_ref": "main",
+    "env": {
+      "ROCM_LLVM_PATH": "/opt/rocm/lib/llvm",
+      "HIP_PATH": "/opt/rocm",
+      "HIP_DEVICE_LIB_PATH": "/opt/rocm/lib/llvm/amdgcn/bitcode",
+      "ROCM_DEVICE_LIB_PATH": "/opt/rocm/lib/llvm/amdgcn/bitcode",
+      "LD_LIBRARY_PATH": "/opt/rocm/lib:/opt/rocm/lib/llvm/lib/clang/23/lib/linux",
+      "AMD_LOG_LEVEL": "1",
+      "HSA_XNACK": "1",
+      "ASAN_OPTIONS": "detect_odr_violation=0:quarantine_size_mb=600",
+      "ASAN_SYMBOLIZER_PATH": "/opt/rocm/lib/llvm/bin/llvm-symbolizer"
+    }
+  }
+}

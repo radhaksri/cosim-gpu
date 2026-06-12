@@ -44,6 +44,9 @@ GEM5_CONTAINER="$(cosim_container_name "$COSIM_RUN_ID")"
 
 QEMU_BIN="${COSIM_DIR}/qemu/build/qemu-system-x86_64"
 DISK_IMAGE="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70"
+# Disk image format passed to QEMU's -drive. Default "raw" preserves the legacy
+# monolithic disk; the layered qcow2 workflow (cosim_vm.py) passes "qcow2".
+DISK_FORMAT="${DISK_FORMAT:-raw}"
 KERNEL="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
 GPU_ROM="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/files/mi300.rom"
 
@@ -93,6 +96,7 @@ Usage: $0 [options]
 
 Options:
   --disk-image PATH       Disk image  (default: auto-detect in gem5-resources)
+  --disk-format FMT       Disk format for QEMU -drive: raw|qcow2 (default: raw)
   --kernel PATH           vmlinux     (default: auto-detect in gem5-resources)
   --qemu-bin PATH         QEMU binary (default: ../qemu/build/qemu-system-x86_64)
   --gem5-bin PATH         gem5 binary (default: build/VEGA_X86/gem5.opt)
@@ -118,6 +122,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --disk-image)    DISK_IMAGE="$2";       shift 2 ;;
+        --disk-format)   DISK_FORMAT="$2";      shift 2 ;;
         --kernel)        KERNEL="$2";           shift 2 ;;
         --qemu-bin)      QEMU_BIN="$2";         shift 2 ;;
         --gem5-bin)      GEM5_BIN="$2";         shift 2 ;;
@@ -446,7 +451,7 @@ QEMU_CMD=(
     -numa "node,memdev=mem0"
     -kernel "$KERNEL"
     -append "$KCMDLINE"
-    -drive "file=$DISK_IMAGE,format=raw,if=virtio"
+    -drive "file=$DISK_IMAGE,format=${DISK_FORMAT},if=virtio"
     -netdev "user,id=net0,hostfwd=tcp::2222-:22"
     -device "virtio-net-pci,netdev=net0"
 )
