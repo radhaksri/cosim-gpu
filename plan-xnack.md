@@ -700,3 +700,33 @@ to identify the agent that keeps accessing the page.
 
 (Note: a throwaway `P7DBG` probe remains in the monolithic disk's amdgpu DKMS module; it is inert
 — only prints on a failed page, which does not occur — and can be reverted with a DKMS rebuild.)
+
+### rocrtst HW(MI325) vs cosim comparison (ASAN build, TheRock run 27320850021)
+Reference: wiki page 1734813712 (#2145), build = run 27320850021, MI325 log = test_rocrtst.log.
+Built cosim with the same build (cosim_vm.py, rocm.run_url pinned to 27320850021) and ran
+`/opt/rocm/bin/rocrtst64` with `GTEST_FILTER=-rocrtstFunc.Memory_Max_Mem` (matching the harness).
+
+**HW (MI325) baseline:** 76 tests / 5 cases; **27 OK, 44 FAILED, then CRASH at test #72**
+`rocrtstPerf.AQL_Dispatch_Time_Single_SpinWait` (ASAN SEGV in `dispatch_time.cc:178
+DispatchTime::RunSingle()`). So the HW reference itself does not fully pass — 44 failures + a crash
+are baked into this ASAN build (real ASAN findings / known issues). Target = match this pattern.
+
+**Cosim result:**
+- Tests 1-3 **match HW**: `rocrtst.Test_Example`, `Test_Example_InterruptDisabled`,
+  `Test_MetadataPrefetchPacket` all OK (1.3-2.0 s each).
+- Test #4 `rocrtstFunc.MemoryAccessTests` **DIVERGES**: subtest `CPUAccessToGPUMemoryTest` passes,
+  then **`GPUAccessToCPUMemoryTest` HANGS** (HW: MemoryAccessTests = OK). Signature is identical to
+  the earlier toy/teardown hang: ROCr main thread busy-spins in userspace (`R`), helper threads in
+  `kfd_wait_on_events` — i.e. ROCr waits on a GPU-completion/event that never arrives for a
+  **GPU-accesses-CPU(system)-memory** operation. This is the dominant sim functional gap.
+
+**Secondary sim robustness gap:** after `pkill -9 rocrtst64` mid-GPU-op, a fresh ROCr init crashes
+the gem5 model (`amdgpu: failed to write reg 38bd4 wait reg 38be6` -> vfio-user broken pipe -> gem5
+container died). Re-init after an aborted process is not handled cleanly.
+
+**Read on the recurring hang:** the common thread across the toy managed-RMW teardown, the HIP
+`__hip_module_dtor` spin, and now `GPUAccessToCPUMemoryTest` is ROCr blocking on a GPU op whose
+completion (signal/event) never reaches the host, specifically around **GPU access to CPU/system
+memory under xnack**. Fixing that completion path is the highest-value next step for reliable
+execution. Next: relaunch with `--gem5-debug PM4PacketProcessor,SDMAEngine,AMDGPUDevice` and run only
+`--gtest_filter=rocrtstFunc.MemoryAccessTests` to capture the pending GPU op at the hang.

@@ -11,6 +11,7 @@
   },
   "rocm": {
     "source": "therock-asan",
+    "run_url": "https://github.com/ROCm/TheRock/actions/runs/27320850021",
     "amdgpu_family": "gfx94X-dcgpu",
     "tests": true,
     "components": "",
