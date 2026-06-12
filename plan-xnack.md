@@ -730,3 +730,250 @@ completion (signal/event) never reaches the host, specifically around **GPU acce
 memory under xnack**. Fixing that completion path is the highest-value next step for reliable
 execution. Next: relaunch with `--gem5-debug PM4PacketProcessor,SDMAEngine,AMDGPUDevice` and run only
 `--gtest_filter=rocrtstFunc.MemoryAccessTests` to capture the pending GPU op at the hang.
+
+### Teardown hang ROOT-CAUSED (gem5 side): SDMA-walker fault loop, NOT compute re-fault (2026-06-12)
+Re-ran `/root/mgd` (managed-RMW) on a booted cosim (`export HSA_XNACK=1`, committed binary `cc8ea3f`)
+with `--gem5-debug GPUPTWalker`, isolating the gem5-log delta for the run + the full ~90s teardown-hang
+window (13.6k lines). Result: `MRESULT: 100..107` correct, then `EXIT=124` (teardown hang) — clean
+reproduction.
+
+**The earlier "compute GPU keeps issuing retry faults / migration ping-pong" hypothesis is WRONG for
+the gem5 mechanism.** In the entire run+hang window the **compute walker parks exactly ONCE and
+retries ONCE** (`Parking faulted walk vaddr=0x74deb247c000`; `doRetryParkedWalks: 1 parked`). The
+compute-side recoverable-fault path is clean and quiescent after the kernel.
+
+**What actually loops (~1100×, the whole hang):** the **SDMA engine walker** `sdmas00.walker`. It walks
+a range of **474 distinct GART/system-aperture VAs** (`0x3fff80…` GART aperture, `0x7fff00…` system
+aperture), and for every one reads a **PDE2 = `0x40000000000000`** (only bit 54 = the PDE `.p` bit set;
+valid bit 0 clear). Per `pagetable_walker.cc:314`, `pde.p` set makes the walker treat the PDE2 as a
+**terminal huge-page (1GB) PTE** (`doEndWalk`), but valid=0 → `Raising page fault.` It then immediately
+re-issues the walk for the next address and re-faults — **with ZERO park/retry** (no `Parking faulted`
+on the SDMA path; SDMA-walker faults have no recovery, unlike the compute walker). The SDMA op never
+completes → host sync/teardown never sees completion → 124.
+(Note: the GPUPTWalker `write:yes` label is misleading — `pagetable_walker.cc:331` prints "yes" when
+`pte.w==0`, i.e. it reports the PTE's *writable* flag, not the access direction.)
+
+**Refined root cause:** at/after teardown an SDMA op accesses a GART/system-aperture region whose GPUVM
+mapping is an **unmapped huge-page placeholder PDE2** (`0x40000000000000`, P-bit set, invalid). The SDMA
+walker faults on it and spins forever because the SDMA translate/walk path has no park-and-retry. This
+is the same "GART/SDMA path" frontier noted above, now pinned to a concrete gem5 mechanism and entry
+value. It is independent of the compute-side xnack+ path (which works).
+
+**Next options:** (a) `--gem5-debug SDMAEngine` correlation run to identify *which* SDMA op (copy /
+fence / rptr-writeback / PTE write) and *why* its destination maps to the invalid placeholder PDE2 at
+teardown — is the placeholder a stale/cleared mapping (a lookup/coherence bug) or genuinely unmapped
+(needs demand-fault); (b) give the SDMA walker the same park-and-retry recovery the compute walker has,
+gated to avoid the known "infinite DMA-retry crash." Core ASAN goal (compute-side not-present demand
+paging) remains met and unaffected.
+Artifact kept: `/tmp/mgd_gem5_run2_keep.log` (full gem5 log of the reproducing run).
+
+### rocrtst full-suite comparison vs MI325 reference (2026-06-12, build 27320850021)
+Ran the wiki's ASAN build (TheRock 0a15f66 / run 27320850021, gfx94X-dcgpu) on the layered cosim VM
+(`cosim_vm.py`, manifest already pinned to this run) with the harness env (HSA_XNACK=1,
+ASAN_OPTIONS=detect_odr_violation=0:quarantine_size_mb=600, ASAN_SYMBOLIZER_PATH, AMD_LOG_LEVEL=1) and
+filter `GTEST_FILTER=-rocrtstFunc.Memory_Max_Mem` (== `test_rocrtst.py` TEST_TYPE=full for this family).
+Reference: `/home/rsrimant/code/mi3xx-cosim/test_rocrtst.log` (MI325). Artifacts saved:
+`rocrtst_cosim_p3.log`, `rocrtst_{ref,cosim}_outcomes.txt`.
+
+**Reference (MI325) baseline:** 27 OK, 44 FAILED, then ASAN SEGV crash at
+`rocrtstPerf.AQL_Dispatch_Time_Single_SpinWait` (`dispatch_time.cc:178 DispatchTime::RunSingle()`) →
+exit 1. The 44 "failures" are gtest assertion failures (functional expectations on this build, e.g.
+`Memory_Atomic_*` expect err 4099 but get HSA_STATUS_SUCCESS), NOT ASAN crashes.
+
+**Result — cosim matches HW on 69/70 commonly-run tests, incl. the identical final ASAN SEGV crash.**
+- All 44 HW assertion-failures reproduce identically on cosim, AND the final ASAN SEGV crash reproduces
+  at the exact same test/line → **ASAN instrumentation works end-to-end under cosim** (the project goal).
+- **3 divergences, all GPU-accesses-CPU-system-memory or device-fidelity, none ASAN-related:**
+  1. `rocrtstFunc.MemoryAccessTests` (HW OK) — **nondeterministic** on cosim: passed once (1297 ms),
+     crashed the gem5 model once at subtest `GPUAccessToCPUMemoryTest` (vfio-user EOF). Coarse-grained
+     GPU→CPU access.
+  2. `rocrtstFunc.MemoryAccessCoherent` (HW OK) — **hangs** on cosim (fine-grained/coherent GPU↔CPU).
+  3. `rocrtstFunc.Memory_Available` (HW OK) — **FAILED** on cosim: a GPU-pool over-allocation that
+     should return err 4099 returns HSA_STATUS_SUCCESS (`memory_basic.cc:539`). cosim VRAM accounting
+     doesn't enforce the available-memory limit; also a topology diff (cosim simulates an MI300A **APU**
+     with gfx942 GPU pools 4/5; the MI325 reference enumerates those pools as CPU/EPYC and skips them).
+
+**Common thread of divergences 1–2:** the GPU-accesses-CPU/system-memory completion path under xnack is
+fragile (hang or model crash), nondeterministically — same root area as the SDMA-walker teardown loop
+above. Divergence 3 is a device-model fidelity gap (VRAM size/accounting + APU-vs-discrete topology),
+not a fault/xnack issue. Env/driver context diff (informational): cosim ROCk 6.14.14, device "MI300A";
+reference ROCk 6.16.13, MI325 / EPYC 9655 — same ROCm userspace ASAN build on both.
+
+Op note: killing rocrtst64 mid-GPU-op (pkill/timeout-KILL) tears down the gem5 model (vfio-user broken
+pipe), and a stale QEMU can hold port 2222 — so test the GPU↔CPU hangers by *excluding* them and reboot
+between runs rather than killing in place.
+
+### Divergence 1-2 investigation (2026-06-12): coherent hang root-caused to AQL queue staleness
+User asked to investigate+fix divergences 1-2 (GPU-accesses-CPU-memory: test1 `MemoryAccessTests`
+nondeterministic crash; test2 `MemoryAccessCoherent` hang). Reproduced `MemoryAccessCoherent` alone on
+the ASAN cosim with layered tracing (SDMAEngine/GPUPTWalker, then PM4PacketProcessor/GPUCommandProc,
+then HSAPacketProcessor/SDMAEngine).
+
+**The hang is NOT translation/fault related (translation works).** It is an AQL-queue dispatch failure:
+- The test enqueues TWO AQL packets on the user compute queue — `BARRIER_AND` (waits on
+  `signal_shader_start`) then kernel `DISPATCH` — and rings the doorbell ONCE (write-index 2). The
+  dependency chain is: SDMA copy1 host->device (sets signal_shader_start) -> barrier releases -> kernel
+  device->device (sets signal_shader_end) -> SDMA copy2 device->host (dep signal_shader_end) -> host.
+- Final hang: `sdmas00` stuck in `POLL_REGMEM addr=<signal_shader_end>, ref=0, retry=0xfff` (infinite)
+  forever — value stays 1. So the kernel never wrote its completion signal.
+- HSAPP trace proves the kernel NEVER dispatched: in the whole run HSAPP processed exactly ONE AQL
+  packet (a vendor-specific one on another queue), ZERO barrier-AND, ZERO kernel-dispatch. The user
+  queue (active list 5) fetched 1 packet then its Qwakeup bailed because `dispPending()` was false.
+- `dispPending()` (`hsa_packet_processor.hh:188`) is false because the fetched packet header read as
+  `HSA_PACKET_TYPE_INVALID` (1), not `BARRIER_AND` (3). And gem5 saw write-index=1 (readIndex 0), not 2.
+  i.e. gem5 acted on a STALE snapshot of guest queue memory (intermediate state: barrier not yet
+  header-written, 2nd packet not yet counted) and NEVER retried.
+
+**Two gem5 defects (both in `src/dev/hsa/hw_scheduler.cc` / HSAPP):**
+1. `HWScheduler::write` (doorbell handler) acts once on the doorbell-time snapshot; if the fetched AQL
+   packet header is still INVALID (guest write not yet visible across the vfio-user/shared-RAM path),
+   `dispPending()` gives up with no re-read/retry -> queue stalls forever. Real HW re-reads the write
+   pointer / packet until valid.
+2. `hw_scheduler.cc:344` `readIndex = doorbell_reg - 1` hardcodes "exactly 1 packet per doorbell", so a
+   batched multi-packet submission (barrier+dispatch, one doorbell) only ever fetches the LAST packet.
+Normal single-packet HIP dispatch dodges both (valid header readable immediately, 1 pkt/doorbell), which
+is why resident kernels work but this test hangs.
+
+**Fix direction (proposed, in HSAPP/scheduler, NOT the fault path):** make AQL fetch robust to guest
+visibility lag — when a doorbelled packet slot (dispIdx < wrIdx) reads INVALID, re-DMA it and reschedule
+instead of stalling; and fetch ALL packets up to the true host write-index rather than assuming one per
+doorbell. Risk: core dispatch path used by every kernel launch — must regression-test resident/managed
+kernels + the rest of rocrtst. Validation cycle = gem5 rebuild + cosim boot (long). Checkpointing with
+user before the change.
+
+### CONFIRMED root cause (instrumented build): one-AQL-packet-per-doorbell
+Diagnostic gem5 build (throwaway `warn()` "AQLDIAG" probes in `hw_scheduler.cc::write` and
+`hsa_packet_processor.cc::QueueProcessEvent::process`) on the coherent test gave:
+```
+AQLDIAG HWSCHED write db=0x4008 doorbell_reg=3 -> wrIdx=3 rdIdx=2   (user compute queue)
+AQLDIAG q5 STALL dispIdx=0 wrIdx=1 cached_header=0x1 host_addr=...   (header INVALID)
+AQLDIAG q5 RE-READ@1us header_lowbytes=0x1                          (still INVALID, NOT a lag)
+```
+Mechanism (`amdgpu_device.cc:638-643` ComputeAQL doorbell -> `hw_scheduler.cc:339-344`):
+- `writeDoorbell` ComputeAQL does `hwScheduler->write(offset, guestDoorbellVal + 1)`.
+- `HWScheduler::write` sets `writeIndex = doorbell_reg` and `readIndex = doorbell_reg - 1` -> spaceUsed
+  is ALWAYS 1 -> gem5 fetches exactly ONE AQL packet per doorbell, at the doorbell-derived index.
+- The test enqueues TWO packets (barrier@0, dispatch@1) and rings the doorbell ONCE with its
+  write_index=2. gem5 computes doorbell_reg=2+1=3 -> fetches packet **index 2** (an empty slot) ->
+  header INVALID -> `dispPending()` false -> permanent stall. Barrier@0 and dispatch@1 are NEVER
+  fetched -> kernel never runs -> SDMA copy-2 polls `signal_shader_end` forever -> hang.
+The re-read staying INVALID proves it's the WRONG SLOT (not a visibility lag): re-DMA won't help.
+Normal HIP rings once per packet (and ROCr internal queues ring with write_index-1, e.g. db=0x4000
+guest-wrote-0 -> doorbell_reg=1 -> fetch index 0, works), so single-dispatch dodges this. The two
+queues observed even use different ring conventions (write_index-1 vs write_index), so gem5's
+doorbell-value-derived single-packet window cannot be correct for both -- the robust fix is to fetch
+the FULL packet range [readIndex, real write_index), reading the true write_index from the AQL queue
+memory rather than trusting the doorbell value + the readIndex=doorbell_reg-1 hack.
+
+### FIX implemented + validated: AQL multi-packet-per-doorbell (gem5 hw_scheduler.cc)
+Fix (uncommitted, `src/dev/hsa/hw_scheduler.cc`):
+- `HWScheduler::write` (doorbell handler): removed `qDesc->readIndex = doorbell_reg - 1` (which forced
+  spaceUsed=1 -> one packet per doorbell). Now only sets `writeIndex = doorbell_reg`, so
+  getCommandsFromHost fetches the full range `[readIndex, writeIndex)`.
+- `HWScheduler::registerNewQueue`: when `rd_idx > 0` (queue map/remap resume), also set
+  `q_desc->readIndex = q_desc->writeIndex = rd_idx`, so readIndex is correct without the per-doorbell
+  reset (handles remap/reuse). Trailing phantom slot from the doorbell `+1` reads INVALID and harmlessly
+  terminates dispatch; it never completes so the host read_dispatch_id (written from aqlBuf->rdIdx) is
+  not corrupted.
+(Also present from session start, unrelated: `unregisterQueue` assert->deschedule for queue-destroy
+mid-process, exercised by rocrtst Counted_Queue_Overflow.)
+
+**Validation (booted ASAN cosim, build 27320850021):**
+- `rocrtstFunc.MemoryAccessCoherent` (div 2) -> **OK** (was: hang). Repeatable.
+- `rocrtstFunc.MemoryAccessTests` (div 1) -> **OK** incl. GPUAccessToCPUMemoryTest subtest.
+- Both together x2 reps -> PASSED, deterministic.
+- **No regression:** GroupMemoryAllocationTest, MemoryAllocateAndFreeTest, Concurrent_Init_Test,
+  Reference_Count, Signal_Create_Concurrently, IPC all still **OK** (PASSED 6 tests) with the fix; boot
+  + GPU init unaffected (single-packet dispatch path identical).
+
+**Remaining (separate, pre-existing, NOT introduced by this fix): nondeterministic gem5 crash on the
+recoverable-fault path.** Under sustained GPU-accesses-CPU-memory load the gem5 model occasionally dies
+(`qemu: failed to read header: EOF`): once on the 3rd repeat of the memory-access tests (correlated with
+a recoverable UTCL2 retry page fault, vmid 8) and once mid full-suite at GroupMemoryAllocationTest (no
+fault dump). The same crash class predates the fix (div-1 nondeterministic crash; the "re-init after
+aborted process crashes the model" note). So the suite still can't reliably run to the AQL_Dispatch ASAN
+crash end-to-end. Next: harden the compute-walker park/retry + IH/doorbell path against the
+recoverable-fault crash (trace `AMDGPUDevice,GPUPTWalker` at the crashing fault). This is the
+robustness frontier; the deterministic AQL hang (div 2) is fixed.
+
+### AQL fix committed; remaining crash diagnosed = SGPR-range panic (instruction decode)
+Committed the AQL multi-packet fix as two gem5 commits:
+- `5aa160e41f dev/hsa: fetch all AQL packets per doorbell ring`
+- `ed8a980a3c dev/hsa: don't abort when a queue is destroyed mid-processing`
+
+Then pursued the nondeterministic crash. By streaming `docker logs -f` of the gem5 container to a file
+(the container is `--rm`, so the crash output is otherwise lost) while looping
+MemoryAccessTests+MemoryAccessCoherent, captured the actual gem5 death — it is NOT vfio-user/coherence:
+```
+src/gpu-compute/static_register_manager_policy.cc:78: panic: SGPR index 40 is out of range: SGPR range=[0,40]
+  mapSgpr <- initDynOperandInfo <- GPUDynInst <- FetchUnit::decodeInsts
+```
+A wavefront decodes an instruction referencing **s40** while only **40** scalar regs are reserved
+(valid s0..s39). Reproduced in 1-2 loop iterations.
+
+Throwaway instrumentation in `gpu_command_processor.cc::dispatchKernelObject` (logging kernel_object +
+granulated SGPR/VGPR counts per dispatch; since reverted) showed the descriptor read is **consistent**:
+every dispatch of the crashing kernel reads `gran_sgpr=4 -> numSgpr=(4+1)*8=40`, `gran_vgpr=0 ->
+numVgpr=8`, same kernel_object. So:
+- NOT a stale/garbage descriptor read (numSgpr is always 40), and NOT the AQL fix dispatching a wrong
+  packet (kernel_object is consistent and valid).
+- The kernel's OWN descriptor declares 40 SGPRs (s0..s39), yet gem5 decodes an instruction using s40 --
+  beyond the kernel's declared usage. So gem5 is occasionally decoding a **bogus instruction** that is
+  not really in the kernel.
+
+**Conclusion: the remaining crash is a gem5 instruction-fetch/decode robustness bug under xnack
+demand-paging** -- the kernel *code* (not the descriptor) is occasionally fetched stale/wrong, so a
+garbage instruction decodes with an out-of-range SGPR operand and panics. Consistent with the
+nondeterminism (descriptor fixed; only the decoded instruction varies). This is separate from and
+deeper than the AQL hang (which is fixed) and the recoverable-fault demand-paging (which works for data).
+
+**Next step (decisive, needs another instrumented build):** at the out-of-range point dump the
+faulting wavefront PC + the raw instruction bytes gem5 fetched, and compare against the actual kernel
+machine code at that PC (read independently). If the bytes are garbage -> stale code-page fetch under
+demand paging (fix the code-fetch coherence / fault the code page in before fetch); if the bytes are a
+valid s40 instruction -> the SGPR-count formula (`hsa_queue_entry.hh:115`, `(gran+1)*8` for gfx942)
+under-counts and must be corrected. Artifact: `gem5_sgpr_crash.log` (full backtrace).
+Note: the current built gem5.opt still contains the (reverted-in-source) AKCDIAG warn; rebuild for a
+clean binary before production use.
+
+### Remaining-crash diagnosis COMPLETE: stale instruction-fetch (not the SGPR formula)
+Instrumented `generateVirtToPhysMap` (throwaway SGPRDIAG warn, since reverted) to dump the faulting
+instruction at the out-of-range SGPR. Captured:
+```
+SGPRDIAG OOB simd=0 wfDynId=140 pc=0x7388d291787c opcode=v_cndmask_b32 rawSel=40 virt_idx=40
+  reserved=40 disasm=[v_cndmask_b32 v0, s40, v1, vcc]
+```
+Decisive: the kernel descriptor consistently declares **40 SGPRs** (s0..s39; AKCDIAG showed numSgpr=40
+every dispatch). A correctly-compiled kernel never references an SGPR >= its declared count, and a plain
+`vector_copy` wouldn't contain `v_cndmask_b32` at all. So gem5 decoded a **garbage instruction from
+stale/wrong fetched code** -> the crash is a **stale instruction-fetch under xnack demand-paging**, NOT
+the SGPR-count formula (`hsa_queue_entry.hh:115`), which is correct.
+
+**The remaining crash is actually a cluster of NON-recoverable handling of not-present/stale memory on
+gem5's control/fetch path under sustained xnack GPU-accesses-CPU-memory load** (both nondeterministic):
+1. **SGPR out-of-range panic** (`static_register_manager_policy.cc:78`) -- instruction *fetch* reads a
+   stale/garbage code page -> decodes a bogus instr with an out-of-range SGPR operand.
+2. **User translation fault fatal** (`amdgpu_vm.cc:764`, `UserTranslationGen::translate`) -- a *functional*
+   page-table walk (SDMA / control path) hits a not-present user page and `fatal()`s instead of recovering.
+The compute *data* park/retry (committed earlier) only covers timing-path data accesses; the
+control-path **functional** reads (instruction fetch code pages; functional walks for SDMA/descriptor)
+have no demand-fault recovery, so they either read stale data (-> garbage decode -> SGPR panic) or fatal.
+
+**Fix direction (deep, multi-subsystem, NOT yet implemented):** make the control/fetch path robust to
+xnack demand paging -- ensure code pages are faulted-in/coherent before instruction fetch decodes them
+(fixes mode 1), and convert the `UserTranslationGen` functional `fatal` into a demand-fault+retry (or a
+presence-gated path) so a not-present control-path page is faulted in rather than crashing (fixes mode 2;
+mind the prior "infinite DMA-retry" caveat on the SDMA path). Both are core robustness changes with real
+regression risk to every kernel launch -> warrants its own focused effort + full regression. Artifacts:
+`gem5_sgpr_diag.log` (SGPRDIAG + SGPR panic), `gem5_transfault_crash.log` (User translation fault).
+All throwaway instrumentation reverted; tree clean at `ed8a980a3c`; gem5.opt rebuilt clean (valid 1GB
+ELF, no diagnostic strings, matches the committed AQL fix). Build note: the heavy gem5.opt link must run
+to completion uninterrupted — backgrounded builds that get interrupted leave a truncated ~85MB zeros
+file (`file` reports "data"); rebuild with a foreground/uninterrupted `scons ... -j2..6` if that happens.
+
+**DECISION (2026-06-12, user):** Stop here — the core goal is met. Compute-side xnack+ recoverable
+demand paging (the ASAN device-shadow dependency) works and is validated; resident `hipMalloc` and
+managed-RMW *data correctness* work. The remaining **SDMA-walker teardown hang** on managed/SVM
+GPU-accesses-system-memory workloads is deemed **out of scope** for the ASAN objective. Re-open only if
+managed-memory full coherence / clean process teardown becomes a requirement; if so, start with the
+"Next options (a)" SDMAEngine correlation run above.
