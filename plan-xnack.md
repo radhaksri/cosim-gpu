@@ -971,6 +971,32 @@ ELF, no diagnostic strings, matches the committed AQL fix). Build note: the heav
 to completion uninterrupted — backgrounded builds that get interrupted leave a truncated ~85MB zeros
 file (`file` reports "data"); rebuild with a foreground/uninterrupted `scons ... -j2..6` if that happens.
 
+### Crash cluster: mode 1 FIXED (TLB flush on VM_INVALIDATE); mode 2 still open (rare)
+Root-caused and fixed the dominant crash mode. gem5 commit `6f369001a3`
+(`dev/amdgpu: flush TLBs on VM_INVALIDATE_REQ`):
+- **Mode 1 (stale-instruction-fetch -> SGPR/VGPR out-of-range panic): FIXED.** The
+  `VM_INVALIDATE_ENGn_REQ` MMIO handler (`amdgpu_vm.cc` writeMMIOGfx940Fault) only re-ran parked walks
+  and never flushed the TLBs, although a VM_INVALIDATE_REQ *is* a hardware TLB flush. After the driver
+  migrated a page under xnack, valid-but-stale TLB entries -- including the per-CU instruction/SQC TLB
+  (all GpuTLBs register into `gpu_tlbs`) -- kept pointing at the page's old physical location, so a
+  later instruction fetch read stale memory and decoded a garbage instruction with an out-of-range
+  register operand -> panic. Fix: call `invalidateTLBs()` before `retryAllParkedWalks()` on the
+  VM_INVALIDATE_REQ. (Explains the "after several iterations, not first-touch" nondeterminism.)
+  **Validated:** the model died within 2-5 loop iterations before; now survives 7+ iterations of the
+  memory-access tests AND a full rocrtst suite to the final ASAN abort with ZERO out-of-range panics
+  (gem5 stays alive; previously the full suite nondeterministically killed the model).
+- **Mode 2 (functional-walk fatal, `UserTranslationGen::translate` "User translation fault"): STILL
+  OPEN, but rare** (0 recurrences across all post-fix validation runs; likely some mode-2 conditions
+  were downstream of the mode-1 staleness). A first attempt to degrade it gracefully by sinking the
+  not-present page to paddr 0 was **UNSAFE** -- the SDMA then read garbage from paddr 0 and hit a new
+  `sdma_engine.cc:695 panic: Invalid SDMA packet`. Reverted. A safe fix needs a GART fallback or a
+  deferred demand-fault for the not-present functional walk, NOT a paddr-0 sink. Tracked in memory
+  [[project-xnack-fetch-crash-followup]]; artifacts `gem5_invalidsdma_crash.log`.
+
+Net: the dominant nondeterministic model death is fixed; the full suite now runs reliably to
+completion. Remaining divergences from MI325 are unchanged by this (cross-test corruption in the
+single-process suite; MemoryAccessCoherent data-verify; the rare mode-2 fatal).
+
 **DECISION (2026-06-12, user):** Stop here — the core goal is met. Compute-side xnack+ recoverable
 demand paging (the ASAN device-shadow dependency) works and is validated; resident `hipMalloc` and
 managed-RMW *data correctness* work. The remaining **SDMA-walker teardown hang** on managed/SVM
