@@ -1014,6 +1014,37 @@ full suite reaches the final ASAN abort. Both crash-cluster modes are now fixed 
 `6f369001a3`; mode 2 = `7655fffae0`). Note: graceful degradation, not correctness — the affected DMA
 bytes may be wrong (so MemoryAccessCoherent still FAILS its data check), but the model no longer dies.
 
+### Goal reframed (user): cosim results must be IDENTICAL to MI325, not just "not crash"
+MemoryAccessCoherent PASSES on MI325 (OK 519ms) -> cosim must pass it too; graceful degradation
+(FAILED) is not acceptable. Characterized (c) the full-suite divergences with the crash fixes in:
+- **Nondeterministic completion:** ~2 of 5 full-suite runs HANG; when they complete it's ~15 OK / ~56
+  FAILED (failure set fairly stable). All divergences are OK-on-HW -> FAILED/hang-on-cosim.
+- **Tests pass in isolation:** a 5-test repro (MemoryAccessTests+MemoryAccessCoherent+Concurrent_Init+
+  Signal_Create+Time_Stamp) ALL passed, incl. MemoryAccessCoherent with correct data. So the GPU can
+  produce correct results; failures emerge only under the full suite's accumulated xnack load.
+
+### Hang ROOT-CAUSED + FIXED (gem5 dd6d4594ff) — write-protect give-up dropped the access
+The nondeterministic full-suite hang was `GpuTLB::parkWrite`: after kMaxWriteRetries it `return`ed
+WITHOUT sending a translation response (dropped the packet). The waiting wavefront blocked on vmcnt
+forever -> kernel never completed -> ROCr waited on a completion that never arrived. Fix: on give-up,
+force the cached TLB entry writable and fall through to normal completion (sendTimingResp) so the
+wavefront proceeds. Validated: a full suite that previously hung now runs to the ASAN abort with the
+force-complete path exercised. This is a RELIABILITY fix (suite completes) — it does NOT fix the data
+divergences (still ~15 OK).
+
+### Remaining work for IDENTICAL results (deeper correctness; NOT yet fixed)
+1. **Cross-test corruption (~11 tests:** Concurrent_Init x2, GroupMemoryAllocationTest, MemoryAllocate
+   x2, Signal x4, Time_Stamp). Pass standalone + pass on HW in-suite; fail on cosim in-suite. The hang
+   fix did NOT recover them (still ~15 OK), so it's a distinct state-accumulation issue (what GPU/queue/
+   signal/resource state earlier tests leave that breaks later ones) — needs its own investigation.
+2. **MemoryAccessCoherent data correctness** (HW OK): host<->device coherent SDMA + signal chain; data
+   wrong under xnack (write-protect drop lands write on RO mapping). Deep SDMA/coherence correctness.
+3. **Memory_Available** (HW OK): cosim's HSA_AMD_AGENT_INFO_MEMORY_AVAIL doesn't decrement on alloc
+   (test asserts available_before - allocated >= available_after). Device-accounting fidelity.
+4. **Separate robustness gap:** re-init after a mid-op ASAN abort segfaults gem5 (each full suite ends
+   in an ASAN abort during AQL_Dispatch; a second full suite in the same boot then crashes on ROCr
+   re-init). Blocks back-to-back suite runs; not a correctness divergence per se.
+
 **DECISION (2026-06-12, user):** Stop here — the core goal is met. Compute-side xnack+ recoverable
 demand paging (the ASAN device-shadow dependency) works and is validated; resident `hipMalloc` and
 managed-RMW *data correctness* work. The remaining **SDMA-walker teardown hang** on managed/SVM
