@@ -615,3 +615,37 @@ not load-bearing in real regime). Reverted: SDMA park/retry (caused GPU-reset ha
 (1) SDMA migration copy data movement; (2) process-teardown hang; (3) rebuild disk to bake in
 `HSA_XNACK=1`. NEW direction: move to a base Ubuntu 24.04 backing disk + ROCm delta (qcow2 overlay)
 workflow before resuming the above.
+
+### DATA-MOVEMENT GAP FIXED (managed RMW now correct)
+Root-caused with `--gem5-debug SDMAEngine,SDMAData` on the apt-ROCm disk
+(xnack-ON). The full HMM round trip's data is correct until the very last write:
+- host->VRAM migrate: `Copy src: 7fff00000000 -> 3ee5cf000`, `First: 0000000100000000`
+  (a[0]=0,a[1]=1) — source read correct (via the existing getGARTAddr(source) +
+  GART path), written to VRAM.
+- kernel +100 in VRAM.
+- VRAM->host migrate-back: `Copy src: 3ee5cf000 -> 7fff00000000`,
+  `First: 0000006500000064` (a[0]=100,a[1]=101) — **read from VRAM correct**, then
+  `Copying to host address 0x7fff00000000`.
+- But `getDeviceAddress 0x7fff00000000 -> 0`: the dest user VA translated to
+  **paddr 0**, so the 100..107 bytes were written to physical 0, not the CPU's
+  page. (After ZONE_DEVICE migration the CPU page is a fresh zero page that the
+  copy-back must fill; the lost write left it zero → `MRESULT` all-zeros.)
+
+**Root cause:** `SDMAEngine::copy()` rewrote a host/system **source** through the
+GART aperture (`getGARTAddr`) for the priv/vmid0 case, but never did so for the
+**destination**. The migration copy-back's host dest was thus untranslated.
+
+**Fix (gem5 `cc8ea3f`):** apply the same `getGARTAddr` rewrite to `pkt->dest`,
+symmetric to the source. Verified on a booted cosim (apt ROCm, `HSA_XNACK=1`):
+- managed `hipMallocManaged` RMW → `MRESULT: 100 101 102 103 104 105 106 107`
+  (was all zeros);
+- resident `hipMalloc` → `RRESULT: 100..107` (unchanged, no regression).
+
+This supersedes the earlier "SDMA migration copy moves zeros" frontier — it was a
+destination-translation bug, not a migration/PTE problem. The earlier user-VA
+routing fix (`5d2dd1c`) is independent and remains for SDMA user-VA poll/copy
+sinks; it is not what carried the migration data.
+
+**Remaining (separate):** process-teardown hang — both managed and resident
+return 124 *after* printing correct results (queue/fault drain at process exit),
+independent of data correctness.
