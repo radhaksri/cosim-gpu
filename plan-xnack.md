@@ -649,3 +649,26 @@ sinks; it is not what carried the migration data.
 **Remaining (separate):** process-teardown hang — both managed and resident
 return 124 *after* printing correct results (queue/fault drain at process exit),
 independent of data correctness.
+
+### Teardown "hang" root-caused: SVM migrate_vma ping-pong livelock (not interrupts)
+Investigated the post-result hang (process returns 124 after printing correct data).
+- **Not xnack-specific, not interrupt delivery.** A clean resident `hipMalloc` run exits
+  `RX=0` and the guest amdgpu MSI-X count rises (e.g. 287->385, +98); during a managed run the
+  count also rises (+85). Interrupts reach the guest fine. (An earlier "frozen count" reading
+  was an artifact of GPU state degraded by prior `kill -9`'d processes.)
+- **Specific to managed/SVM memory.** Resident exits cleanly; `hipMallocManaged` livelocks.
+- **Root cause (driver dynamic-debug `kfd_svm.c`/`kfd_migrate.c`):** the same managed page
+  ping-pongs forever:
+  `CPU page fault -> migrate gpu->ram -> sdma copy memory fence done ->`
+  **`unsuccessful/cpages/npages 0x0/0x1/0x1`** (Linux migrate_vma committed 0 pages) `->`
+  `Mapping range ... on domain: GPU (vram 1) -> CPU page fault (same addr) -> ...`
+  The bytes DO reach the CPU page (the GART-dest fix `cc8ea3f` makes the result correct), but
+  `migrate_vma` never commits the device->system page-ownership transfer, so the kernel keeps the
+  page GPU-resident, re-maps it to VRAM, the CPU re-faults, and it loops.
+- **Nature:** a Linux HMM / amdgpu **ZONE_DEVICE migrate_vma bookkeeping** issue in the guest
+  (migrate_vma_pages returning 0 successful — typically a device-page refcount/isolation check),
+  **not a gem5 data-path bug**. Correctness is unaffected (results are right before the loop).
+- **Next step (if pursued):** instrument the driver's device->ram migrate path
+  (`svm_migrate_vram_to_ram`/`svm_migrate_copy_to_ram` + the `migrate_vma_pages` result) to see
+  why the collected device page is not committed (refcount on the ZONE_DEVICE page, dst alloc, or
+  the cosim pgmap page lifecycle). This is a kernel/driver investigation, separate from gem5.
