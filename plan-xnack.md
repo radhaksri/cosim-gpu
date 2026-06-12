@@ -672,3 +672,31 @@ Investigated the post-result hang (process returns 124 after printing correct da
   (`svm_migrate_vram_to_ram`/`svm_migrate_copy_to_ram` + the `migrate_vma_pages` result) to see
   why the collected device page is not committed (refcount on the ZONE_DEVICE page, dst alloc, or
   the cosim pgmap page lifecycle). This is a kernel/driver investigation, separate from gem5.
+
+### CORRECTION: teardown "livelock" is a GPU<->CPU migration THRASH, migrations SUCCEED
+The prior section ("migrate_vma commits 0 pages") was a **misread**. The driver prints
+`unsuccessful/cpages/npages 0x0/0x1/0x1` where the first field is the *unsuccessful* count:
+`0x0` unsuccessful = the device->ram migration **succeeds** (1 page migrated). Confirmed with a
+throwaway probe in `svm_migrate_vma_to_ram` (dump unsuccessful pages' refcount) which **never
+fired** — there are no failed pages.
+
+Correct root cause (driver dynamic-debug, single managed page e.g. `0x704c83cf9`):
+```
+GPU retry fault: best restore 0x43a1, actual loc 0x0  -> migrate to VRAM (successful 0x1) -> map domain GPU
+CPU page fault  0x704c83cf9000                          -> migrate to RAM  (0 unsuccessful = success)
+... repeats forever
+```
+It is a **migration ping-pong / thrash**: after the kernel finishes (results are correct — the
+GART-dest fix `cc8ea3f` works), **the gem5 GPU keeps issuing retry faults on the managed page**
+(`best_restore = GPU`), so the driver migrates it back to VRAM; the host process's access then
+faults it back to RAM; repeat. Both migrations succeed; the loop never terminates, so the process
+never exits (124). Resident `hipMalloc` has no SVM page and exits cleanly.
+
+**So the sim-side question is: why does the gem5 GPU keep faulting on the managed page after the
+kernel has completed?** (a wavefront/queue not retiring, or the xnack park/retry re-issuing an
+access that should be done). That is a gem5 compute/queue or xnack-replay issue, not a migrate_vma
+or refcount problem. Next step: trace gem5 GPU page-fault/park-retry during the post-result window
+to identify the agent that keeps accessing the page.
+
+(Note: a throwaway `P7DBG` probe remains in the monolithic disk's amdgpu DKMS module; it is inert
+— only prints on a failed page, which does not occur — and can be reverted with a DKMS rebuild.)
