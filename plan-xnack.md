@@ -1319,3 +1319,21 @@ Net: all four hipblaslt blockers are now fixed (sramecc+, kernel-launch invalida
 vfio msg-loop livelock, and this MultipleDevices give-up crash). Remaining gap to a full identical run
 is purely cosim SPEED (per-test ~8min; MultipleDevices >30min) -- no remaining hangs/crashes through
 test 19. The 18 earlier tests already matched HW exactly.
+
+---
+
+## Task #32 resolution — gem5-resources change IS needed (no revert) (2026-06-17, new system)
+
+Re-checked whether the gem5-resources repoint (zevorn -> radhaksri @ 500e080f) done during the
+migration was actually necessary. Verdict: **needed; keep as-is, do not revert to upstream.**
+
+- gem5-resources `500e080f` ("x86-ubuntu-gpu-ml: add layered cosim disk build") ADDS the entire
+  layered disk-build system: `src/x86-ubuntu-gpu-ml/layers/{base,kernel,driver,rocm}.pkr.hcl`,
+  `build-rocm-asan.sh`, `build-layer.sh`, `scripts/*-install.sh`, `http/user-data` (15 files, 1116
+  insertions). The `layers/` dir does not exist in its parent; the whole chain is custom cosim work,
+  not in upstream gem5-resources.
+- `cosim_vm.py` hard-depends on it: `if not self.layers_dir.is_dir(): die(...)` and every layer is
+  built from `layers/*.pkr.hcl` + `build-layer.sh` + `build-rocm-asan.sh`. Reverting to upstream
+  would remove these and break `run_mi300x_fs.sh build-disk` / the whole disk-image build.
+- Therefore gem5-resources stays pinned to radhaksri/gem5-resources @ 500e080f and cosim-gpu keeps
+  the repoint (commit 09fa5b9). No change required.
