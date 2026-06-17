@@ -4,7 +4,7 @@
     "ubuntu": "24.04.2"
   },
   "kernel": {
-    "version": "6.8.0-79-generic"
+    "version": "6.8.0-124-generic"
   },
   "driver": {
     "amdgpu_repo_ver": "7.0"

@@ -32,7 +32,7 @@ variable "output_dir" {
 
 variable "kernel_version" {
   type    = string
-  default = "6.8.0-79-generic"
+  default = "6.8.0-124-generic"
 }
 
 variable "ssh_password" {

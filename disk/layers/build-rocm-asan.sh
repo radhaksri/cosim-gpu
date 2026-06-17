@@ -63,7 +63,7 @@ if [ ! -d "${SRC}/build_tools" ]; then
     rm -rf "$SRC"
     git clone --depth=1 --filter=blob:none --sparse \
         --branch "${THEROCK_REF}" "https://github.com/${THEROCK_REPO}.git" "$SRC"
-    git -C "$SRC" sparse-checkout set build_tools
+    git -C "$SRC" sparse-checkout set build_tools cmake
 else
     git -C "$SRC" fetch --depth=1 origin "${THEROCK_REF}" >/dev/null 2>&1 || true
     git -C "$SRC" checkout -q "${THEROCK_REF}" >/dev/null 2>&1 || true
