@@ -3,4 +3,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 \
         libjson-c-dev \
         libjson-c5 \
+        ccache \
     && rm -rf /var/lib/apt/lists/*
+
+# Put ccache's compiler masquerade symlinks first on PATH so scons' g++/gcc/cc/c++
+# invocations are transparently cached. CCACHE_DIR is bind-mounted at run time so
+# the cache survives across --rm containers (see the cosim build commands).
+ENV PATH=/usr/lib/ccache:$PATH

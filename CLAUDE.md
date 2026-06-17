@@ -7,12 +7,11 @@
 ./scripts/run_mi300x_fs.sh build-all
 cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
 
-# Option B: manual (build Docker image first — json-c needed by ext/libvfio-user)
+# Option B: manual (build Docker image first — json-c + ccache live in the image)
 cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
-cd gem5 && docker run --rm -v "$(pwd):/gem5" -w /gem5 \
-    gem5-run:local \
-    scons build/VEGA_X86/gem5.opt -j4
-cd ../qemu && mkdir -p build && cd build && ../configure --target-list=x86_64-softmmu && make -j$(nproc)
+./scripts/build_gem5.sh                 # gem5.opt with ccache (persistent host cache)
+# (./scripts/build_gem5.sh --stats to see ccache hit/miss; JOBS=N to cap parallelism)
+cd qemu && mkdir -p build && cd build && ../configure --target-list=x86_64-softmmu && make -j$(nproc)
 cd ../..
 docker run --rm -v "$(pwd)/gem5:/gem5" -w /gem5 gem5-run:local \
     bash -c "cd util/m5 && scons build/x86/out/m5"
@@ -21,6 +20,21 @@ cp gem5/util/m5/build/x86/out/m5 disk/files/
 ```
 
 Use `-j1` for gem5 linking if OOM-killed.
+
+## Performance
+
+- **CPU governor:** set `performance` (`sudo cpupower frequency-set -g performance`).
+  gem5's GPU model is **single-threaded**, so simulation (and build) speed scales with
+  single-core clock; `powersave` leaves ~15-20% on the table.
+- **ccache:** enabled via `Dockerfile.run` + `build_gem5.sh` (persistent cache at
+  `~/.cache/gem5-ccache`). Speeds up iterative gem5 rebuilds.
+- **QEMU `-smp` does NOT speed up GPU tests.** gem5 (the GPU simulator) is the
+  serial bottleneck; the guest CPU work is KVM-native and mostly idle waiting on
+  the GPU. Adding guest vCPUs only helps guest-side CPU-parallel work, which
+  rocrtst/hipblaslt are not. Expect ~2 host cores busy during a run (1 gem5 + 1 QEMU).
+- For faster non-debug runs, a `gem5.fast` build (`scripts/build_gem5.sh
+  build/VEGA_X86/gem5.fast`) is ~20-30% faster but strips DPRINTF traces — keep
+  `gem5.opt` for debugging.
 
 ## Launch
 
