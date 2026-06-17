@@ -1,7 +1,7 @@
 [submodule "gem5"]
 	path = gem5
-	url = git@github.com:zevorn/gem5.git
-	branch = cosim-gpu
+	url = git@github.com:radhaksri/gem5.git
+	branch = mi300-xnack+
 [submodule "qemu"]
 	path = qemu
 	url = git@github.com:zevorn/qemu.git

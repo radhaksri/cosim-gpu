@@ -25,7 +25,12 @@ export HSA_ENABLE_INTERRUPT=0
 # Needs the gem5 fault/replay + interrupt path (see plan-xnack.md Phases 2-4);
 # until those land, only no-fault / pre-resident workloads are expected to pass.
 export HSA_XNACK=1
-export HCC_AMDGPU_TARGET=gfx942:xnack+
+# sramecc+ : real MI300/MI325 reports gfx942:sramecc+:xnack+ (RAS/PSP-derived).
+# The cosim disables PSP/SMU (ip_block_mask=0x67) and RAS (ras_enable=0), so KFD
+# reports sramecc-. Force the ROCr ISA feature to match HW so code-object selection
+# (comgr) picks the same slices as hardware. ROCr override: amd_gpu_agent.cpp:167-173.
+export HSA_ENABLE_SRAMECC=1
+export HCC_AMDGPU_TARGET=gfx942:sramecc+:xnack+
 
 # ---- Detect GPU count ----
 GPU_COUNT=$(lspci -d 1002: | grep -c "Display\|VGA\|3D" || echo 0)

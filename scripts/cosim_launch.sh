@@ -280,6 +280,7 @@ step "Starting gem5 MI300X GPU model in Docker..."
 GEM5_DOCKER_CMD=(
     docker run -d --rm
     --name "$GEM5_CONTAINER"
+    --cap-add=SYS_PTRACE
     --user "$(id -u):$(id -g)"
     -v "${GEM5_DIR}:/gem5"
     -v /tmp:/tmp

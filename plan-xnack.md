@@ -1051,3 +1051,271 @@ managed-RMW *data correctness* work. The remaining **SDMA-walker teardown hang**
 GPU-accesses-system-memory workloads is deemed **out of scope** for the ASAN objective. Re-open only if
 managed-memory full coherence / clean process teardown becomes a requirement; if so, start with the
 "Next options (a)" SDMAEngine correlation run above.
+
+---
+
+## hipblaslt-test comparison vs MI325 reference (2026-06-12)
+
+User asked: run hipblaslt tests in cosim, check if results identical to `test_hipblaslt.log`
+(MI325 HW reference, build run 27320850021, gfx94X-dcgpu ASAN). Result: **NOT identical** —
+structural divergence; cosim never reaches the test phase.
+
+**Reference (MI325 HW) outcome — itself a near-immediate failure:**
+- hipblaslt-test enumerates 73674 tests / 14 suites, but the ASAN build's GPU kernels do not load:
+  `error: named symbol not found` (Transform_S_S_110_16_16_VW_4 ...) on the MatrixTransform tests, then
+  `error: device kernel image is invalid (200)` at `hipblaslt_init_device.cpp:104` on the first real
+  GEMM (`_/matmul_test.matmul/pre_checkin_alpha_beta_zero_NaN_...`, log line 449).
+- Only ~26 tests actually run: 20 OK (host-only API: aux_handle/aux_ext/aux_attr, ExtOpTest
+  failure-paths, matmul bad_arg), 5 FAILED (MatrixTransformTest.*, all because hipblasLtCreate fails).
+- Process then aborts with `SUMMARY: AddressSanitizer: 167704463 byte(s) leaked`, exit status 1
+  (test_hipblaslt.py raises CalledProcessError). Device line: `gfx942:sramecc+:xnack+`.
+- i.e. the reference is a kernel-code-object packaging defect in the hipblaslt ASAN build, identical
+  bytes on HW and sim.
+
+**Cosim outcome — hangs in HIP/HSA runtime init, never runs a test:**
+- Same binary, same env (HSA_XNACK=1, ASAN_OPTIONS=detect_odr_violation=0:quarantine_size_mb=600),
+  exec'd directly (NOTE: wrapping in `stdbuf`/`bash -c` breaks ASAN -> "ASan runtime does not come
+  first in initial library list"; must exec the binary directly).
+- Prints the version banner (`hipBLASLt version: 100400` / git `cba2fcf8`) then HANGS: never reaches
+  even `Query device success` / the device-info line / the 73674-test enumeration.
+- Signature = classic cosim GPU-wait hang: **guest CPU (qemu) pegged at 100%** busy-spinning on a GPU
+  completion signal that never arrives, while gem5 runs ~90% doing GART/queue/vendor-packet work
+  (`Ignoring vendor packet`, GART "first successful translation", SDMA/queue activity). Two independent
+  attempts (buffered run ~18 min; line-buffered direct run ~21 min) both stalled at the SAME point with
+  zero stdout past the banner. Killing the host left gem5 spinning on orphaned wavefronts (a kernel was
+  actually dispatched) — confirming cosim got into GPU execution that HW never did.
+- cosim device id differs from HW: rocminfo reports `gfx942:sramecc-:xnack+` plus a
+  `gfx9-4-generic:sramecc-:xnack+` ISA variant, vs HW `gfx942:sramecc+:xnack+`. Different code-object
+  selection is the likely reason cosim does not reproduce HW's instant "named symbol not found" load
+  failure and instead proceeds into (stuck) GPU work.
+- Partial console artifact: `cosim-gpu/artifacts/hipblaslt_cosim_console_hipblaslt-lb-20260612-162556.log`.
+
+**Bottom line:** cosim cannot even get to the point where the HW reference begins failing. HW runs 26
+tests then aborts on the kernel-image defect; cosim hangs in runtime init and runs 0 tests. This is a
+new divergence bucket (HSA/HIP init hang on the hipblaslt workload), distinct from the rocrtst buckets.
+
+---
+
+## sramecc+ implementation + hipblaslt blocker (2026-06-12, cont.)
+
+Goal: make cosim advertise `gfx942:sramecc+:xnack+` (HW match) and get hipblaslt-test to
+produce identical results to the MI325 reference.
+
+**sramecc+ : IMPLEMENTED and VALIDATED.**
+- Trace: ROCr builds the ISA feature suffix in `amd_gpu_agent.cpp:165-178`. `sramecc` only set if
+  the base ISA supports it (gfx942 does), then `flag().sramecc_enable()`:
+  `HSA_ENABLE_SRAMECC=1` -> SRAMECC_ENABLED -> forces `sramecc+` regardless of KFD
+  (`flag.h:237-239`). Default path reads KFD `node_props.Capability.SRAM_EDCSupport` (bit 26).
+- KFD sets that bit iff `adev->ras_enabled & BIT(AMDGPU_RAS_BLOCK__GFX)` (kfd_topology.c:2234-2237),
+  which needs PSP-populated RAS capability (regMP0_SMN_C2PMSG_127). The cosim disables PSP/SMU
+  (ip_block_mask=0x67) and RAS (ras_enable=0), so KFD always reports sramecc-. gem5 models NO
+  ECC/RAS/sramecc state -> the suffix is 100% guest-driver/ROCr-derived.
+- Chosen lever (matches the "stock driver unmodified" constraint): `HSA_ENABLE_SRAMECC=1` env var,
+  the AMD-sanctioned override, exactly like HSA_XNACK=1. Baked into `cosim-gpu/cosim-vm.json`
+  (env block -> /etc/environment) and `cosim-gpu/scripts/cosim_guest_setup.sh`. NO gem5 rebuild.
+- VALIDATED live: with `export HSA_ENABLE_SRAMECC=1`, rocminfo reports
+  `amdgcn-amd-amdhsa--gfx942:sramecc+:xnack+` (and the gfx9-4-generic variant also flips to
+  sramecc+). Device target now identical to MI325 HW.
+
+**hipblaslt "identical results" : BLOCKED by a separate, deeper gem5 bug (NOT sramecc).**
+sramecc+ did NOT change hipblaslt behavior — it still hangs in HIP runtime init, before any test.
+AMD_LOG_LEVEL=4 trace pinpoints the exact hang:
+- HIP init does `hipMalloc(26MB)` -> `hipMemset` which dispatches rocclr's internal
+  `__amd_rocclr_fillBufferAligned` shader kernel -> then `hipFree` -> last log line:
+  `rocvirtual.cpp:798: Host wait on completion_signal=0x...` which never returns.
+- The fill kernel's wavefront HANGS executing in gem5: after killing the host, gem5 stays at 99% CPU
+  (orphaned wavefront still running). gem5 event log is frozen (no new GART/sequencer events) and has
+  NO xnack/retry/park give-up warnings -> it is NOT the known xnack retry paths; it's an in-kernel
+  loop or CU-model livelock with no further memory ops.
+- Guest-side: worker thread `R` at 100% userspace, flat minflt + flat RSS + `syscall=running` over
+  30s = tight busy-wait on the completion signal (HSA active-wait); sibling thread in
+  `kfd_wait_on_events`. Confirmed true hang, not slow progress. Reproduces with sramecc- too.
+- Why hipblaslt hits it but rocrtst doesn't: the init memset is 26MB on DEVICE memory, which routes
+  to the GPU shader fill (`rocblit.cpp:2434`: host-fill only if `disableFillBuffer_` or
+  host-direct-access memory; device mem -> GPU kernel). `disableFillBuffer_` is an internal bitfield,
+  NOT env-controllable, and `GPU_FORCE_BLIT_COPY_SIZE` governs copy (not fill). So no config
+  workaround to avoid the hanging kernel.
+
+**Net:** the requested sramecc+ capability is done. The end-goal is gated by a gem5 GPU-compute
+execution hang of rocclr's fillBufferAligned (first hipMemset of HIP init). Next step to make it
+tractable: re-run with gem5 `--gem5-debug GPUExec` (or GPUDisp/WavefrontStats) to capture the
+repeating loop body / stuck PC of the orphaned wavefront, then fix the CU-model execution of that
+kernel. This is the same "cosim GPU compute hang" class as the rocrtst hangs; expect an open-ended
+CU-model debug. Trace artifact: /root/hb.err inside the (now torn-down) VM; reproduce via
+HSA_ENABLE_SRAMECC=1 AMD_LOG_LEVEL=4 /opt/rocm/bin/hipblaslt-test.
+
+---
+
+## GPU compute kernel-launch invalidate livelock — ROOT-CAUSED & FIXED (2026-06-12)
+
+**Symptom:** Every compute kernel hung at launch in cosim. hipblaslt's first `hipMemset`
+(rocclr `__amd_rocclr_fillBufferAligned`, a 25MB device fill) never returned; `hipFree`'s
+`Host wait on completion_signal` (rocvirtual.cpp:798) spun forever. Affects BOTH rocrtst and
+hipblaslt compute paths (it gates kernel launch generally).
+
+**Root cause (gem5 `src/mem/ruby/system/VIPERCoalescer.cc::invTCP`):** On a kernel launch with an
+acquire fence, the dispatcher invalidates each CU's L1 (TCP) and will not launch until all
+invalidates complete (dispatcher.cc:163-185; trace: "kernel 0 failed to launch, due to [40] pending
+invalidate requests"). `invTCP()` walked ALL cache block indices and enqueued a `REPLACEMENT` for
+each. For invalid/not-present/empty blocks, `CacheMemory::getAddressAtIdx()` returns **0**
+(CacheMemory.cc:205-209). On any TCP that is not 100% full (always true at the first launch — the
+cache is empty), this enqueues many REPLACEMENT requests **all aliasing line address 0x0**. The
+GPU_VIPER-TCP mandatory queue uses `block_on="LineAddress"`, so every duplicate-0x0 request stalls
+behind the first and never wakes -> the per-block `inv_invDone`/`invTCPCallback` callbacks never all
+fire -> `m_num_pending_invs` never returns to 0 -> the L1 invalidate never completes -> dispatcher
+livelocks forever. Confirmed by trace: "There are 0 Invalidations outstanding before Cache Walk"
+followed by a flood of "Evicting addr 0x0" (every evict address 0x0), dispatcher stuck at [40].
+
+**Fix:** In `invTCP()`, skip blocks whose address is 0 (the invalid sentinel) so only genuinely
+valid lines are invalidated (distinct addresses -> no block_on stall). And if the walk finds no
+valid lines (`m_num_pending_invs == 0`), complete the kernel-launch invalidate immediately
+(completeHitCallback) since no per-block callback will fire. gem5 rebuilt (VEGA_X86/gem5.opt).
+
+**Verified:** With the fix, the dispatcher logs "failed to launch ... pending invalidate" only ~2x
+(until the invalidate completes) then dispatches workgroups and the kernel runs. Device hipMemset
+now executes AND completes correctly: 4KB ~2s, 64KB 2s, 1MB (~13 WGs) 24s, all "SYNCED ok / DONE
+rc=0". Before the fix these livelocked forever. THIS is the GPU compute kernel execution hang.
+
+**REMAINING (separate, deeper) — large-workgroup scale stall:** fills with many workgroups are
+super-linearly slow / effectively stuck. 1MB (~13 WGs) = 24s, but 8MB (~102 WGs) did NOT finish in
+>22 min; the 25MB/320-WG case dispatches exactly 200 WGs (all CU slots: 40 CUs x 5) then freezes
+with the gem5 log idle and CPU pegged — the in-flight WGs don't complete so no new WGs dispatch.
+This blocks hipblaslt's 25MB init memset from completing in practical time, so full hipblaslt still
+can't run end-to-end. Likely a CU-occupancy / WG-completion / memory-contention issue at scale,
+distinct from the invalidate livelock. Next: --gem5-debug GPUExec/GPUSched on an ~8MB fill to see
+whether the dispatched wavefronts are spinning (in-kernel loop / s_waitcnt) or the CU scheduler
+livelocks at high occupancy. Repro in guest (ASAN-correct): build memrepro2.cpp with
+`hipcc --offload-arch=gfx942`, run with HSA_XNACK=1 HSA_ENABLE_SRAMECC=1
+LD_PRELOAD=/opt/rocm/lib/llvm/lib/clang/23/lib/linux/libclang_rt.asan-x86_64.so memrepro2 <size>.
+
+---
+
+## Large-workgroup scale stall — CHARACTERIZED as a kernel-end event-loop livelock (2026-06-13)
+
+After the invalidate-livelock fix, compute kernels launch and small/medium device fills complete
+fully: hipMemset of 4KB ~2s, 64KB 2s, 1MB 24s, 4MB ~140s (all "SYNCED ok / DONE rc=0", and gem5
+GPUWgLatency shows all 320 WGs Begin+Complete + "Kernel Complete"). The fill kernel
+(__amd_rocclr_fillBufferAligned) always uses a FIXED 320-WG / 81920-thread grid-stride grid
+regardless of buffer size, so size changes the per-thread iteration count, not the WG count.
+
+**At >=8MB the kernel hangs at the very END.** GPUExec + ref-counter tracing show all 320 workgroups
+execute and reach `s_endpgm`, and ALL 320 reach "decrease ref ctr WG[n] to [0]" (every WG retires).
+But the host's hipDeviceSynchronize never returns (stdout stuck at "memset issued", no "SYNCED").
+Decisive test: the gem5 **simulated tick is frozen** (identical over 40s) while the gem5 host process
+pegs 99.8% CPU -> a **zero-latency event reschedule loop** (some event re-schedules at curTick()
+forever, so sim time never advances). This is a true gem5 event-loop livelock at kernel end, reached
+only by large kernels; 4MB and below finish the end-of-kernel sequence (GL2 flush -> completion
+signal) and return. No xnack/GART/fault warnings during the stall -> not the demand-paging path; not
+the addr-0 cache-walk bug (the kernel-end GL2 flush is a TCC-protocol writeback, not a coalescer
+cache walk).
+
+The invalidate fix did not cause this — it unblocked launch and thereby made large kernels REACH the
+pre-existing kernel-end livelock. This is the remaining blocker for hipblaslt: its init does a 25MB
+device memset (same 320-WG fill, large dirty footprint) which hits this livelock, so full hipblaslt
+still can't get past init.
+
+**Next step:** find the zero-time rescheduler. Candidates: GPUCoalescer `issueEvent`
+(GPUCoalescer.cc:1038-1039 schedules at curTick() when uncoalescedTable.packetAvailable()), the
+GPUDispatcher tickEvent, or the TCC/GL2 kernel-end flush completion. Approach: run an ~8MB fill and,
+once sim-time freezes, capture a short `--debug-flags=Event` window (very high volume — capture <1s)
+to see which event reschedules at the same tick repeatedly, then fix that component to advance time /
+complete the kernel-end. Repro unchanged (memrepro2.cpp, size 8388608, with the LD_PRELOAD'd ASAN
+runtime). gem5 binary currently includes the invalidate fix (VEGA_X86/gem5.opt, built 2026-06-12).
+
+---
+
+## Kernel-end livelock ROOT-CAUSED & FIXED — vfio-user message loop (2026-06-16)
+
+The large-fill "kernel-end stall" was a gem5<->QEMU livelock, root-caused via gdb (installed in the
+gem5 container; relaunch with `--cap-add=SYS_PTRACE`, added to cosim_launch.sh). All 3 backtrace
+samples of the frozen gem5 showed it inside
+`MI300XVfioUser::processVfuEvents -> vfu_run_ctx -> recvmsg` (mi300x_vfio_user.cc:330), and
+`gem5::curTick()` was IDENTICAL across 20s = simulated time truly FROZEN while the host CPU pegged.
+
+Root cause: `processVfuEvents()` drained pending vfio-user messages in an UNBOUNDED
+`while(true){ vfu_run_ctx(); }` loop. A guest that busy-waits (ROCr signal polling with
+HSA_ENABLE_INTERRUPT=0, as the cosim sets) streams vfio-user MMIO requests continuously, so
+vfu_run_ctx() keeps returning 0 ("processed a message") and the loop NEVER returns to gem5's event
+queue -> curTick() can never advance -> the pending GPU kernel-completion event never fires -> the
+signal the guest is polling is never written -> permanent mutual livelock. Small device fills finish
+and signal before the guest enters a sustained poll; large fills (>=8MB) don't, so they hung. (The
+fill kernel's own AQL packet has completion_signal=0; host sync relies on the post-kernel
+completion/queue-drain, which is what the frozen event queue prevented.)
+
+Fix: bound the loop to `kMaxMsgsPerCall = 1024` messages per `processVfuEvents()` call, then break and
+yield to the event queue so sim time advances and GPU events fire; remaining messages are picked up by
+the PollEvent / keepalive. Normal (non-flood) operation is unaffected (vfu_run_ctx returns EAGAIN and
+breaks naturally well under the cap). gem5 rebuilt.
+
+VERIFIED (device hipMemset, previously deadlocked at >=8MB):
+  4KB/64KB/1MB/4MB: complete (as before)
+  8MB:  8M_RC=0 secs=90   (was: permanent deadlock)
+  25MB: 25M_RC=0 secs=450 (was: permanent deadlock) <- this is hipblaslt's init memset size
+So both gem5 GPU-compute hangs are now fixed: (1) kernel-LAUNCH invalidate livelock
+(VIPERCoalescer::invTCP addr-0 skip) and (2) kernel-END vfio-user message-loop livelock
+(processVfuEvents bound). Compute kernels of any size now launch, execute, complete, and signal the
+host. Cosim is slow at scale (cycle-level + cross-process memory) but no longer hangs.
+
+---
+
+## hipblaslt end-to-end run after all fixes — MATCHES HW for 18 tests, new crash at test 19 (2026-06-16)
+
+With sramecc+ + both compute-hang fixes, hipblaslt-test now runs the actual test suite (was: hung in
+init). Result vs the MI325 reference (test_hipblaslt.log), test-for-test IDENTICAL through 18 tests:
+  - 6 aux_handle_test: OK (each ~7.5-8 min in cosim — every hipblasLtCreate re-runs the heavy
+    rocRoller preload; aux_handle set/get sm_count create a handle so they're slow; the 2 aux_ext +
+    6 aux_attr tests take ~0 ms, no handle) -> 14 OK total, matches HW.
+  - MatrixTransformTest.InvalidConfigurations/NullA/NullB/ScalarsOnDevice: FAILED with the EXACT HW
+    error: "getKernel failed: Transform_S_S_110_16_16_VW_4 ... error: named symbol not found" +
+    matrix_transform_gtest.cpp:792 Failure -> 4 FAILED, matches HW.
+  Device line: "AMD Instinct MI300A gfx942:sramecc+:xnack+" (target matches MI325 HW).
+
+NEW CRASH at test 19 = MatrixTransformTest.MultipleDevices (HW cleanly FAILS this one). Guest dmesg:
+  amdgpu [gfxhub0] retry page fault (vmid:8 pasid:32769) for hipblaslt-test, addr 0x70d3fe700000,
+  IH client 0x1b (UTCL2), VM_L2_PROTECTION_FAULT_STATUS:0x00800000 (all sub-fields 0x0)
+then QEMU aborts: `qemu-system-x86_64: util/error.c:62: error_setv: Assertion *errp == NULL failed`
+(core dumped) -> cosim teardown. So an xnack RETRY page fault during MultipleDevices drives a QEMU-side
+error_setv double-set assertion -> whole-sim crash. Distinct from the fixed hangs; sibling of the
+xnack crash cluster (see [[project-xnack-fetch-crash-followup]], which had "failed to read header: EOF").
+gem5-side log not captured (container --rm'd on QEMU death; recapture by tee'ing `docker logs <gem5
+container>` BEFORE teardown, or disable auto-teardown).
+
+Net: from "hangs in init, 0 tests" to "identical to HW for 18 tests incl. the key kernel-load-failure
+divergence, then a new QEMU error_setv crash at MultipleDevices blocking the last ~7 tests + final
+ASAN abort". Per-test cosim cost (~8 min/handle-creating test) makes full runs multi-hour.
+Next: root-cause the retry-fault -> QEMU error_setv crash (gem5 fault-delivery vs QEMU vfio-user error
+handling). Likely needs gem5-side trace at the fault + QEMU error path inspection.
+
+---
+
+## QEMU error_setv crash at MultipleDevices — ROOT-CAUSED (gem5 TLB) & FIXED (2026-06-17)
+
+The "QEMU error_setv assertion" crash at hipblaslt MatrixTransform.MultipleDevices was a DOWNSTREAM
+symptom: gem5 crashed first, breaking the vfio-user socket, after which QEMU's recv path aborted.
+Root-caused by tee'ing the gem5 container log live (docker logs -f before the --rm teardown):
+
+  src/arch/amdgpu/vega/tlb.cc:562: warn: xnack: write to 0x... still read-only after 8 retries;
+      force-completing to avoid wavefront/ROCr hang
+  gem5.opt: src/mem/protocol/timing.cc:51: Assertion `pkt->isRequest()' failed.
+  backtrace: GpuTLB::translationReturn -> sendTimingReq -> sendReq (assert)
+
+The xnack write-protect give-up path (the earlier hang fix) force-completes a write by converting its
+packet to a RESPONSE and sending it back. Under MultipleDevices' read-then-write retrying on managed
+memory, a force-completed (response) packet could still be present in parkedWrites and get re-issued by
+doRetryParkedWrites -> issueTLBLookup -> translationReturn's TLB_MISS path -> sendTimingReq, which
+asserts pkt->isRequest() -> gem5 abort -> socket break -> QEMU error_setv abort -> whole-sim crash.
+
+Fix (tlb.cc doRetryParkedWrites): skip already-completed packets -- `if (!pkt->isRequest()) continue;`
+before re-issuing. Never re-issue a force-completed write through the translation path. gem5 rebuilt.
+
+VALIDATED: re-ran hipblaslt-test --gtest_filter='*MultipleDevices*'. The "force-completing" give-up
+fired (the exact crash trigger) and gem5 SURVIVED (0 isRequest/abort/panic; gem5+QEMU stayed up). The
+test progressed to the HW-matching "error: named symbol not found" and recorded gtest failures, instead
+of crashing the sim. (It hit my 1800s timeout = exit 124 because MultipleDevices is very slow in cosim
+-- not a crash.) Debug aid: relaunch gem5 container has --cap-add=SYS_PTRACE (cosim_launch.sh); a
+temporary util/error.c backtrace instrumentation was added then reverted (QEMU rebuilt clean).
+
+Net: all four hipblaslt blockers are now fixed (sramecc+, kernel-launch invalidate livelock, kernel-end
+vfio msg-loop livelock, and this MultipleDevices give-up crash). Remaining gap to a full identical run
+is purely cosim SPEED (per-test ~8min; MultipleDevices >30min) -- no remaining hangs/crashes through
+test 19. The 18 earlier tests already matched HW exactly.
