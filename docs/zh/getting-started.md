@@ -120,7 +120,7 @@ make -j$(nproc)
 ### 手动构建
 
 ```bash
-cd gem5-resources/src/x86-ubuntu-gpu-ml
+cd disk
 ./build.sh -var "qemu_path=/usr/sbin/qemu-system-x86_64"
 ```
 
@@ -130,8 +130,8 @@ cd gem5-resources/src/x86-ubuntu-gpu-ml
 
 | 产物 | 路径 | 大小 |
 |---|---|---|
-| 磁盘镜像 | `gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70` | 约 55 GB |
-| 内核 | `gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70` | 约 64 MB |
+| 磁盘镜像 | `disk/disk-image/x86-ubuntu-rocm70` | 约 55 GB |
+| 内核 | `disk/vmlinux-rocm70` | 约 64 MB |
 
 > **提示（国内网络）：** 如果构建过程中包下载卡住，可以应用国内镜像补丁加速 VM 内的 `apt`。详见[参考手册 §7](reference.md#7-国内镜像配置)。
 
@@ -214,9 +214,9 @@ qemu-system-x86_64 \
     -m 8G -smp 4 \
     -object memory-backend-file,id=mem0,size=8G,mem-path=/dev/shm/cosim-guest-ram,share=on \
     -numa node,memdev=mem0 \
-    -kernel /home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70 \
+    -kernel /home/zevorn/cosim/disk/vmlinux-rocm70 \
     -append "console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu" \
-    -drive file=/home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70,format=raw,if=virtio \
+    -drive file=/home/zevorn/cosim/disk/disk-image/x86-ubuntu-rocm70,format=raw,if=virtio \
     -device 'vfio-user-pci,socket={"type":"unix","path":"/tmp/gem5-mi300x.sock"}' \
     -nographic -no-reboot
 ```

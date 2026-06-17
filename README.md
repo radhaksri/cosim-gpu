@@ -89,7 +89,7 @@ cd ../..
 docker run --rm -v "$(pwd)/gem5:/gem5" -w /gem5 \
     gem5-run:local \
     bash -c "cd util/m5 && scons build/x86/out/m5"
-cp gem5/util/m5/build/x86/out/m5 gem5-resources/src/x86-ubuntu-gpu-ml/files/
+cp gem5/util/m5/build/x86/out/m5 disk/files/
 
 # 6. Build disk image (Ubuntu 24.04 + ROCm 7.0, ~40min, needs KVM + ~60GB disk)
 ./scripts/run_mi300x_fs.sh build-disk

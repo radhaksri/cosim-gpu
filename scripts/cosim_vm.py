@@ -73,7 +73,7 @@ class Cosim:
         self.config_path = config_path
         self.manifest = json.loads(config_path.read_text())
         layers_rel = self.manifest.get(
-            "layers_dir", "gem5-resources/src/x86-ubuntu-gpu-ml/layers"
+            "layers_dir", "disk/layers"
         )
         self.layers_dir = (self.cosim_dir / layers_rel).resolve()
         if not self.layers_dir.is_dir():

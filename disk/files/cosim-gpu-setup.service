@@ -1,0 +1,14 @@
+[Unit]
+Description=MI300X Co-simulation GPU Setup
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cosim-gpu-setup.sh
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

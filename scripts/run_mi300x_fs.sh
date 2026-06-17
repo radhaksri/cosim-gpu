@@ -27,12 +27,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COSIM_DIR="$(dirname "$SCRIPT_DIR")"
 GEM5_DIR="${COSIM_DIR}/gem5"
-RESOURCES_DIR="${COSIM_DIR}/gem5-resources"
+RESOURCES_DIR="${COSIM_DIR}/disk"
 
 # Built artifacts (ROCm 7.0 disk image)
-DISK_IMAGE_DIR="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/disk-image"
+DISK_IMAGE_DIR="${RESOURCES_DIR}/disk-image"
 DISK_IMAGE="${DISK_IMAGE_DIR}/x86-ubuntu-rocm70"
-KERNEL="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
+KERNEL="${RESOURCES_DIR}/vmlinux-rocm70"
 SQUARE_APP="${RESOURCES_DIR}/src/gpu/square/bin.default/square.default"
 GEM5_BIN="${GEM5_DIR}/build/VEGA_X86/gem5.opt"
 
@@ -203,7 +203,7 @@ build_disk_image() {
     info "Build log:  $BUILD_DISK_LOG"
 
     mkdir -p "$LOGS_DIR"
-    cd "${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml"
+    cd "${RESOURCES_DIR}"
     local proxy_args=()
     if [ -n "${https_proxy:-}" ]; then
         proxy_args+=(-var "http_proxy=${https_proxy}")

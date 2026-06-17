@@ -24,8 +24,8 @@ Each run boots a throwaway scratch overlay, so the named layers stay pristine.
 - **gem5** built: `gem5/build/VEGA_X86/gem5.opt` (see `CLAUDE.md` → Build).
 - **QEMU** built: `qemu/build/qemu-system-x86_64` and `qemu/build/qemu-img`.
 - **gem5 run image**: `docker build -t gem5-run:local -f scripts/Dockerfile.run scripts/`
-- **packer** fetched: `gem5-resources/src/x86-ubuntu-gpu-ml/packer`
-  (run `gem5-resources/src/x86-ubuntu-gpu-ml/build.sh` once if missing).
+- **packer** fetched: `disk/packer`
+  (run `disk/build.sh` once if missing).
 - **libguestfs-tools** (only for the `therock-asan` ROCm source): `sudo apt-get install -y libguestfs-tools`
   (a guest kernel is auto-downloaded for it — no extra setup).
 - **gh** authenticated (only for `therock-asan`): `gh auth status`.
@@ -39,7 +39,7 @@ Each run boots a throwaway scratch overlay, so the named layers stay pristine.
 
 ```jsonc
 {
-  "layers_dir": "gem5-resources/src/x86-ubuntu-gpu-ml/layers",
+  "layers_dir": "disk/layers",
   "base":   { "ubuntu": "24.04.2" },
   "kernel": { "version": "6.8.0-79-generic" },          // Linux kernel
   "driver": { "amdgpu_repo_ver": "7.0" },               // amdgpu-dkms repo channel
@@ -149,4 +149,4 @@ python3 scripts/cosim_vm.py launch --no-build    # boot without auto-building st
 - **ASAN images are large** (full build ≈ 77 GB); the layer virtual size is
   200 GB. Host cost is only the actual used bytes (qcow2 sparse).
 - Per-layer mechanics and variant builds: see
-  `gem5-resources/src/x86-ubuntu-gpu-ml/layers/README.md`.
+  `disk/layers/README.md`.

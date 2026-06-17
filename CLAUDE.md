@@ -16,7 +16,7 @@ cd ../qemu && mkdir -p build && cd build && ../configure --target-list=x86_64-so
 cd ../..
 docker run --rm -v "$(pwd)/gem5:/gem5" -w /gem5 gem5-run:local \
     bash -c "cd util/m5 && scons build/x86/out/m5"
-cp gem5/util/m5/build/x86/out/m5 gem5-resources/src/x86-ubuntu-gpu-ml/files/
+cp gem5/util/m5/build/x86/out/m5 disk/files/
 ./scripts/run_mi300x_fs.sh build-disk
 ```
 

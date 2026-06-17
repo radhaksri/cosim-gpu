@@ -108,8 +108,8 @@ console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu
 | Artifact | Path | Size |
 |----------|------|------|
 | gem5 binary | `build/VEGA_X86/gem5.opt` | ~1.1 GB |
-| Disk image | `../gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70` | ~55 GB |
-| Kernel | `../gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70` | ~64 MB |
+| Disk image | `../disk/disk-image/x86-ubuntu-rocm70` | ~55 GB |
+| Kernel | `../disk/vmlinux-rocm70` | ~64 MB |
 | QEMU binary | `qemu/build/qemu-system-x86_64` | -- |
 
 ---

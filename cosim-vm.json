@@ -1,5 +1,5 @@
 {
-  "layers_dir": "gem5-resources/src/x86-ubuntu-gpu-ml/layers",
+  "layers_dir": "disk/layers",
   "base": {
     "ubuntu": "24.04.2"
   },

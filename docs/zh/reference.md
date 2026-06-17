@@ -108,8 +108,8 @@ console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu
 | 产物 | 路径 | 大小 |
 |------|------|------|
 | gem5 二进制 | `build/VEGA_X86/gem5.opt` | 约 1.1 GB |
-| 磁盘镜像 | `../gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70` | 约 55 GB |
-| 内核 | `../gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70` | 约 64 MB |
+| 磁盘镜像 | `../disk/disk-image/x86-ubuntu-rocm70` | 约 55 GB |
+| 内核 | `../disk/vmlinux-rocm70` | 约 64 MB |
 | QEMU 二进制 | `qemu/build/qemu-system-x86_64` | -- |
 
 ---

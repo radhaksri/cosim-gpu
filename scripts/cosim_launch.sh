@@ -34,7 +34,7 @@ export COSIM_RUN_ID
 
 # ---- Path defaults ----
 GEM5_DIR="${COSIM_DIR}/gem5"
-RESOURCES_DIR="${COSIM_DIR}/gem5-resources"
+RESOURCES_DIR="${COSIM_DIR}/disk"
 
 GEM5_BIN="${GEM5_DIR}/build/VEGA_X86/gem5.opt"
 # shellcheck disable=SC2034
@@ -43,12 +43,12 @@ GEM5_DOCKER_IMAGE="${GEM5_DOCKER_IMAGE:-gem5-run:local}"
 GEM5_CONTAINER="$(cosim_container_name "$COSIM_RUN_ID")"
 
 QEMU_BIN="${COSIM_DIR}/qemu/build/qemu-system-x86_64"
-DISK_IMAGE="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70"
+DISK_IMAGE="${RESOURCES_DIR}/disk-image/x86-ubuntu-rocm70"
 # Disk image format passed to QEMU's -drive. Default "raw" preserves the legacy
 # monolithic disk; the layered qcow2 workflow (cosim_vm.py) passes "qcow2".
 DISK_FORMAT="${DISK_FORMAT:-raw}"
-KERNEL="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
-GPU_ROM="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/files/mi300.rom"
+KERNEL="${RESOURCES_DIR}/vmlinux-rocm70"
+GPU_ROM="${RESOURCES_DIR}/files/mi300.rom"
 
 SOCKET_PATH="/tmp/gem5-mi300x-${COSIM_RUN_ID}.sock"
 SHMEM_PATH="/mi300x-vram-${COSIM_RUN_ID}"
@@ -95,9 +95,9 @@ QEMU + gem5 MI300X Co-simulation Launcher
 Usage: $0 [options]
 
 Options:
-  --disk-image PATH       Disk image  (default: auto-detect in gem5-resources)
+  --disk-image PATH       Disk image  (default: auto-detect in disk/)
   --disk-format FMT       Disk format for QEMU -drive: raw|qcow2 (default: raw)
-  --kernel PATH           vmlinux     (default: auto-detect in gem5-resources)
+  --kernel PATH           vmlinux     (default: auto-detect in disk/)
   --qemu-bin PATH         QEMU binary (default: ../qemu/build/qemu-system-x86_64)
   --gem5-bin PATH         gem5 binary (default: build/VEGA_X86/gem5.opt)
   --gem5-docker IMAGE     Docker image for gem5 (default: gem5-run:local)

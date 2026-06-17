@@ -8,5 +8,5 @@
 	branch = cosim-gpu
 [submodule "gem5-resources"]
 	path = gem5-resources
-	url = https://github.com/radhaksri/gem5-resources.git
-	branch = mi300-xnack+
+	url = https://github.com/gem5/gem5-resources.git
+	branch = stable

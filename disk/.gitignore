@@ -1,0 +1,10 @@
+**packer
+**packer_*.zip
+packer_cache/
+disk-image/
+vmlinux-gpu-ml
+files/corporate-ca/*.crt
+# Layered cosim build outputs (qcow2 images, caches, extracted vmlinux, state)
+layers/disk-image-*/
+layers/.cache/
+layers/.cosim-layers-state.json

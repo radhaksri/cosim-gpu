@@ -120,7 +120,7 @@ If `gem5-resources` does not exist, it will be cloned automatically before the b
 ### Manual Build
 
 ```bash
-cd gem5-resources/src/x86-ubuntu-gpu-ml
+cd disk
 ./build.sh -var "qemu_path=/usr/sbin/qemu-system-x86_64"
 ```
 
@@ -130,8 +130,8 @@ cd gem5-resources/src/x86-ubuntu-gpu-ml
 
 | Artifact | Path | Size |
 |---|---|---|
-| Disk Image | `gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70` | ~55 GB |
-| Kernel | `gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70` | ~64 MB |
+| Disk Image | `disk/disk-image/x86-ubuntu-rocm70` | ~55 GB |
+| Kernel | `disk/vmlinux-rocm70` | ~64 MB |
 
 > **Tip (China network):** If the build hangs on package downloads, apply the China mirror patch to speed up `apt` inside the VM. See [Reference §7](reference.md#7-china-mirror-configuration) for instructions.
 
@@ -214,9 +214,9 @@ qemu-system-x86_64 \
     -m 8G -smp 4 \
     -object memory-backend-file,id=mem0,size=8G,mem-path=/dev/shm/cosim-guest-ram,share=on \
     -numa node,memdev=mem0 \
-    -kernel /home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70 \
+    -kernel /home/zevorn/cosim/disk/vmlinux-rocm70 \
     -append "console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu" \
-    -drive file=/home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70,format=raw,if=virtio \
+    -drive file=/home/zevorn/cosim/disk/disk-image/x86-ubuntu-rocm70,format=raw,if=virtio \
     -device 'vfio-user-pci,socket={"type":"unix","path":"/tmp/gem5-mi300x.sock"}' \
     -nographic -no-reboot
 ```
