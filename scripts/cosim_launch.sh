@@ -312,6 +312,11 @@ GEM5_DOCKER_CMD+=(
 
 info "gem5 container '$GEM5_CONTAINER' started"
 
+# Persist gem5 stdout/stderr to a file so a panic/abort is not lost when the
+# --rm container disappears on exit. Streams in the background until the
+# container stops.
+docker logs -f "$GEM5_CONTAINER" > "${SESSION_DIR}/gem5.log" 2>&1 &
+
 # ==================================================================
 # Step 2: Wait for gem5 cosim socket to be ready
 # ==================================================================
