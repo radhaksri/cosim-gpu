@@ -1337,3 +1337,27 @@ migration was actually necessary. Verdict: **needed; keep as-is, do not revert t
   would remove these and break `run_mi300x_fs.sh build-disk` / the whole disk-image build.
 - Therefore gem5-resources stays pinned to radhaksri/gem5-resources @ 500e080f and cosim-gpu keeps
   the repoint (commit 09fa5b9). No change required.
+
+---
+
+## Disk-build relocation into cosim-gpu/disk (2026-06-17, cosim-gpu 4975f38)
+
+Resolves the task-#32 portability problem at its root. The layered cosim disk-build
+previously existed **only** in the radhaksri/gem5-resources fork commit `500e080f`;
+nothing upstream gem5-resources was used, so carrying it as a full fork caused
+local-only-commit clone failures.
+
+- Moved the entire `x86-ubuntu-gpu-ml` tree into `cosim-gpu/disk/` (base/kernel/driver/
+  rocm packer layers, `build-{base,layer,rocm-asan}.sh`, `files/`, `http/`).
+- Reverted the **gem5-resources submodule to pristine upstream `f77ee85f`** (the merge-base
+  the cosim commits branched from; a genuine ancestor of `gem5/gem5-resources` `stable`).
+  `.gitmodules` url -> `github.com/gem5/gem5-resources`, branch -> `stable`.
+- Path updates: `cosim-vm.json`/`cosim_vm.py` `layers_dir` -> `disk/layers`; build-script
+  `COSIM_DIR` depth `../../../..` -> `../..`; `cosim_launch.sh`/`run_mi300x_fs.sh` -> `disk/`
+  (incl. `GPU_ROM` -> `disk/files/mi300.rom`); `test_modprobe_params.sh` ->
+  `disk/files/cosim-gpu-setup.sh`; cn-mirror patch -> `disk/layers/http/user-data`; docs.
+- Validated: `bash -n` + `py_compile` clean; `cosim_vm.py status` resolves `disk/layers` and
+  all 4 layers; `packer validate` resolves relative `../files/` paths (only `m5` absent =
+  build artifact); modprobe-params test passes.
+- Deleted the fork's `mi300-xnack+` branch (`500e080f`); only `stable` remains on
+  radhaksri/gem5-resources. `500e080f` preserved in cosim-gpu history at gitlink `d470a31`.
