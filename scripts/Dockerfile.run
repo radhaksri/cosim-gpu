@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libjson-c-dev \
         libjson-c5 \
         ccache \
+        gdb \
     && rm -rf /var/lib/apt/lists/*
 
 # Put ccache's compiler masquerade symlinks first on PATH so scons' g++/gcc/cc/c++

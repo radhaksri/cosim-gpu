@@ -11,12 +11,12 @@
   },
   "rocm": {
     "source": "therock-asan",
-    "run_url": "https://github.com/ROCm/TheRock/actions/runs/27320850021",
+    "run_url": "https://github.com/ROCm/TheRock/actions/runs/27591111200",
     "amdgpu_family": "gfx94X-dcgpu",
     "tests": true,
-    "components": "",
+    "components": "--amdgpu-targets gfx942",
     "therock_repo": "ROCm/TheRock",
-    "therock_ref": "main",
+    "therock_ref": "a66d9e6f80e014dbec2a71df3c443cd9c5fccd7f",
     "env": {
       "ROCM_LLVM_PATH": "/opt/rocm/lib/llvm",
       "HIP_PATH": "/opt/rocm",
